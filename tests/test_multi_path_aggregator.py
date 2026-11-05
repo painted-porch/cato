@@ -596,3 +596,91 @@ class TestParallelDecisionArtifactLoading:
         # Now query root_b's project -- must not come back empty or return proj_a's data.
         second = agg._load_decisions(project_id="proj_b")
         assert {d["id"] for d in second} == {"d_b1"}
+
+    def test_json_fallback_applies_per_root_not_on_combined_emptiness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A root needing JSON fallback must not lose its data just because
+        another root succeeded via persistence (Codex finding on cato#50's
+        fix PR: testing whether the combined result across every root is
+        empty, instead of each root independently, hides root_a's
+        JSON-only decisions the moment root_b's persistence succeeds)."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        # root_a has no sqlite persistence for its project -- only a JSON export.
+        (root_a / "data" / "project_history" / "proj_a").mkdir(parents=True)
+        _write_decisions_json(
+            root_a,
+            "proj_a",
+            [{"id": "d_a1", "project_id": "proj_a", "what": "chose Y"}],
+        )
+        # root_b has a real persistence-backed project (no JSON needed).
+        (root_b / "data" / "project_history" / "proj_b").mkdir(parents=True)
+
+        class _FakeDecision:
+            def __init__(self, data: dict[str, Any]) -> None:
+                self._data = data
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._data
+
+        class _FakePersistence:
+            async def load_decisions(self, pid: str) -> list[_FakeDecision]:
+                if pid == "proj_b":
+                    return [_FakeDecision({"id": "d_b1", "project_id": "proj_b"})]
+                return []
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+
+        def _fake_get_persistence(root: Path) -> Any:
+            return _FakePersistence() if root == root_b else None
+
+        monkeypatch.setattr(agg, "_get_marcus_persistence", _fake_get_persistence)
+
+        decisions = agg._load_decisions(project_id=None)
+        ids = {d["id"] for d in decisions}
+        assert "d_b1" in ids, "root_b's persistence-backed decision missing"
+        assert "d_a1" in ids, (
+            "root_a's JSON-fallback decision was dropped because root_b's "
+            "persistence succeeded -- fallback must be evaluated per root"
+        )
+
+    def test_artifact_json_fallback_applies_per_root_not_on_combined_emptiness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same fallback-must-be-per-root fix, for artifacts."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        (root_a / "data" / "project_history" / "proj_a").mkdir(parents=True)
+        _write_artifacts_json(
+            root_a, "proj_a", [{"id": "a_a1", "project_id": "proj_a", "name": "x.md"}]
+        )
+        (root_b / "data" / "project_history" / "proj_b").mkdir(parents=True)
+
+        class _FakeArtifact:
+            def __init__(self, data: dict[str, Any]) -> None:
+                self._data = data
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._data
+
+        class _FakePersistence:
+            async def load_artifacts(self, pid: str) -> list[_FakeArtifact]:
+                if pid == "proj_b":
+                    return [_FakeArtifact({"id": "a_b1", "project_id": "proj_b"})]
+                return []
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+
+        def _fake_get_persistence(root: Path) -> Any:
+            return _FakePersistence() if root == root_b else None
+
+        monkeypatch.setattr(agg, "_get_marcus_persistence", _fake_get_persistence)
+
+        artifacts = agg._load_artifacts(project_id=None)
+        ids = {a["id"] for a in artifacts}
+        assert "a_b1" in ids, "root_b's persistence-backed artifact missing"
+        assert "a_a1" in ids, (
+            "root_a's JSON-fallback artifact was dropped because root_b's "
+            "persistence succeeded -- fallback must be evaluated per root"
+        )
