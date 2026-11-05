@@ -117,14 +117,30 @@ def store(tmp_path: Path) -> Any:
 
 @pytest.fixture
 def client(store: Any) -> TestClient:
-    """TestClient with store / aggregator dependencies overridden."""
+    """TestClient with store / aggregator dependencies overridden.
+
+    Overrides both the single-source (``get_store``/``get_aggregator``,
+    still used by write endpoints) and multi-source (``get_stores``/
+    ``get_aggregators``, used by read endpoints since cato#52)
+    dependencies with the same one-store single-source setup, so every
+    existing single-instance test keeps exercising exactly one source.
+    """
     from src.cost_tracking.cost_aggregator import CostAggregator
 
     from backend.api import app
-    from backend.cost_routes import get_aggregator, get_store
+    from backend.cost_routes import (
+        get_aggregator,
+        get_aggregators,
+        get_store,
+        get_stores,
+    )
 
     app.dependency_overrides[get_store] = lambda: store
     app.dependency_overrides[get_aggregator] = lambda: CostAggregator(store=store)
+    app.dependency_overrides[get_stores] = lambda: [("default", store)]
+    app.dependency_overrides[get_aggregators] = lambda: [
+        ("default", CostAggregator(store=store))
+    ]
     try:
         yield TestClient(app)
     finally:
