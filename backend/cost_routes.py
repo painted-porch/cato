@@ -245,6 +245,29 @@ def _find_owning_store(
     return stores[0][1]
 
 
+def _find_budget_store(
+    project_id: str,
+    aggregators: List[Tuple[str, Any]],
+    stores: List[Tuple[str, Any]],
+) -> Any:
+    """Return the store holding this project's existing budget cap, if any.
+
+    A budget set before a project has any cost events lives wherever
+    :func:`_find_owning_store` happened to default to at that time (the
+    first configured source). Once the project's events subsequently
+    land in a *different* source, ``_find_owning_store`` alone would
+    silently switch budget reads/writes to that source too, orphaning
+    the original cap (cato#52, Codex finding on PR #53). Checking every
+    source for an existing budget row first, before falling back to the
+    events-owning source, keeps a previously accepted cap visible and
+    editable no matter which source its events end up on.
+    """
+    for _, store in stores:
+        if store.get_project_budget(project_id) is not None:
+            return store
+    return _find_owning_store(project_id, aggregators, stores)
+
+
 # ---------------------------------------------------------------------------
 # Project-name resolution
 # ---------------------------------------------------------------------------
@@ -411,18 +434,21 @@ router = APIRouter(prefix="/api/cost", tags=["cost"])
 
 @router.post("/ingest")  # type: ignore[misc]
 def trigger_ingest(
-    store: Any = Depends(get_store),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """Sweep ``~/.claude/projects/`` and ingest any new worker session events.
 
     Marcus's :class:`WorkerJSONLIngester` is idempotent (UUID-dedupes
-    per process) so calling this on every dashboard load is safe.
+    per process) so calling this on every dashboard load is safe. Each
+    session is routed to whichever configured source already owns its
+    project (cato#52), so worker events never land in a different
+    database than that project's planner events.
     Returns a small summary so the UI can show "X new events ingested
     from Y files" if it wants.
     """
     from backend.cost_ingest import run_ingest
 
-    return run_ingest(store)
+    return run_ingest(stores)
 
 
 @router.get("/projects")  # type: ignore[misc]
@@ -559,15 +585,16 @@ def project_summary(
     Searches every configured cost source for the one owning this
     project (cato#52); falls back to the first source's zero totals
     when the project has no events anywhere, preserving the pre-#52
-    response shape for an unknown project_id.
+    response shape for an unknown project_id. Resolves ``project_name``
+    from that same matched source only -- merging every source's name
+    map would let an unrelated source's stale registry entry overwrite
+    the owning source's correct snapshot name (cato#52, Codex finding
+    on PR #53).
     """
-    names: Dict[str, str] = {}
-    for _, store in stores:
-        names.update(_load_project_names(store=store))
-
-    for _, agg in aggregators:
+    for (_, agg), (_, store) in zip(aggregators, stores):
         totals = agg.project_totals(project_id)
         if (totals.get("events") or 0) > 0:
+            names = _load_project_names(store=store)
             return {
                 "project_id": project_id,
                 "project_name": names.get(project_id),
@@ -576,6 +603,8 @@ def project_summary(
             }
 
     _, first_agg = aggregators[0]
+    _, first_store = stores[0]
+    names = _load_project_names(store=first_store)
     return {
         "project_id": project_id,
         "project_name": names.get(project_id),
@@ -594,10 +623,11 @@ def get_project_budget(
 
     Surfaced to the dashboard's Budget tab so it can render
     spend-vs-cap when a ceiling is set, falling back to spend-only
-    when not. Reads from whichever configured source actually owns
-    this project's cost data (cato#52).
+    when not. Reads from whichever configured source actually holds
+    this project's budget row, or owns its cost events if no budget
+    has been set yet (cato#52).
     """
-    store = _find_owning_store(project_id, aggregators, stores)
+    store = _find_budget_store(project_id, aggregators, stores)
     row = store.get_project_budget(project_id)
     return {"project_id": project_id, "budget": row}
 
@@ -614,11 +644,13 @@ def put_project_budget(
     Idempotent upsert on Marcus's side; the cap survives Cato
     restarts because it's persisted to costs.db. Passing
     ``budget_usd <= 0`` clears the cap (deletes the row). Written to
-    whichever configured source actually owns this project's cost
-    data, or the first configured source if the project has none yet
-    (cato#52).
+    whichever configured source already holds this project's budget
+    row, so an update or clear always lands on the existing cap
+    rather than silently creating an orphaned one elsewhere; falls
+    back to whichever source owns the project's cost events, or the
+    first configured source, when no budget has been set yet (cato#52).
     """
-    store = _find_owning_store(project_id, aggregators, stores)
+    store = _find_budget_store(project_id, aggregators, stores)
     store.set_project_budget(
         project_id=project_id,
         budget_usd=payload.budget_usd,
@@ -643,19 +675,20 @@ def project_full_summary(
     (PR #515) with fallback to projects.json.
 
     Searches every configured cost source in order and returns the
-    first match (cato#52).
+    first match (cato#52). Resolves ``project_name`` from that same
+    matched source only -- merging every source's name map would let
+    an unrelated source's stale registry entry overwrite the owning
+    source's correct snapshot name (cato#52, Codex finding on PR #53).
 
     Raises
     ------
     HTTPException
         404 if the project has no token events on any configured source.
     """
-    for _, agg in aggregators:
+    for (_, agg), (_, store) in zip(aggregators, stores):
         summary: Optional[Dict[str, Any]] = agg.project_summary(project_id)
         if summary is not None:
-            names: Dict[str, str] = {}
-            for _, store in stores:
-                names.update(_load_project_names(store=store))
+            names = _load_project_names(store=store)
             summary["project_name"] = names.get(project_id)
             return summary
     raise HTTPException(status_code=404, detail="project not found")

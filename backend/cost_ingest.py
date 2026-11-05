@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +125,51 @@ def resolve_binding_from_cwd(record: Dict[str, Any]) -> Optional["AgentBinding"]
 # ---------------------------------------------------------------------------
 
 
-def run_ingest(store: Any) -> Dict[str, Any]:
+def _peek_project_id(jsonl: Path) -> Optional[str]:
+    """Read just enough of one session file to learn its project_id.
+
+    A worker session's ``cwd`` (and therefore its resolved project_id) is
+    the same for every record in one JSONL file in practice -- one
+    process, one worktree. Reading ahead like this, separately from the
+    real ingest pass, lets the caller pick the right target store
+    *before* ingesting, without guessing.
+
+    Returns
+    -------
+    str or None
+        The resolved project_id, or None if no record in the file
+        resolves (the caller then falls back to a default store; the
+        real ingest pass will still correctly skip every record there).
+    """
+    try:
+        with jsonl.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                binding = resolve_binding_from_cwd(record)
+                if binding is not None:
+                    return str(binding.project_id)
+    except OSError:
+        return None
+    return None
+
+
+def run_ingest(stores: List[Tuple[str, Any]]) -> Dict[str, Any]:
     """Sweep ``~/.claude/projects/`` and ingest every session JSONL.
+
+    Each session is routed to whichever configured cost source already
+    owns its project's events (falling back to the first configured
+    source for a project with no events anywhere yet), instead of
+    always writing to one fixed store. Without this, a project whose
+    planner events live in a second configured database would get its
+    worker events written into the first database instead on every
+    sweep -- silently splitting one project's cost data across two
+    databases (cato#52, Codex finding on PR #53).
 
     Idempotent — :class:`WorkerJSONLIngester` dedupes by record UUID
     within a single process. Re-running the sweep on the same files
@@ -134,8 +177,9 @@ def run_ingest(store: Any) -> Dict[str, Any]:
 
     Parameters
     ----------
-    store : CostStore
-        Marcus's cost store to write events into.
+    stores : List[Tuple[str, Any]]
+        ``(source_label, store)`` pairs for every configured cost
+        source, as returned by ``backend.cost_routes.get_stores()``.
 
     Returns
     -------
@@ -146,11 +190,21 @@ def run_ingest(store: Any) -> Dict[str, Any]:
         number of sessions whose cwd didn't resolve (project-creators,
         monitors, ad-hoc sessions outside the experiment layout).
     """
+    from src.cost_tracking.cost_aggregator import CostAggregator
     from src.cost_tracking.worker_ingester import WorkerJSONLIngester
 
     base = Path.home() / ".claude" / "projects"
     if not base.exists():
         return {"ingested": 0, "files": 0, "skipped_unbound": 0}
+
+    aggregators = [CostAggregator(store=store) for _, store in stores]
+
+    def _owning_store(project_id: str) -> Any:
+        for agg, (_, store) in zip(aggregators, stores):
+            totals = agg.project_totals(project_id)
+            if (totals.get("events") or 0) > 0:
+                return store
+        return stores[0][1]
 
     skipped_unbound = 0
 
@@ -161,12 +215,21 @@ def run_ingest(store: Any) -> Dict[str, Any]:
             skipped_unbound += 1
         return b
 
-    ingester = WorkerJSONLIngester(store=store, resolve_binding=_wrap_resolver)
+    # One ingester per configured store, reused across every file routed
+    # to it, so the per-process dedupe cache (keyed by record UUID) still
+    # works across repeated sweeps against the same source.
+    ingesters = {
+        id(store): WorkerJSONLIngester(store=store, resolve_binding=_wrap_resolver)
+        for _, store in stores
+    }
 
     ingested = 0
     files = 0
     for jsonl in base.rglob("*.jsonl"):
         files += 1
+        project_id = _peek_project_id(jsonl)
+        target_store = _owning_store(project_id) if project_id else stores[0][1]
+        ingester = ingesters[id(target_store)]
         try:
             ingested += ingester.ingest_file(jsonl)
         except Exception:

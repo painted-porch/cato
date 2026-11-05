@@ -284,3 +284,161 @@ class TestExportCsvMultiSource:
             "run_b1" not in resp.text.splitlines()[0]
         )  # header row has no run_id column
         assert len(resp.text.splitlines()) == 2  # header + 1 event row
+
+
+@requires_marcus
+class TestIngestRoutesToOwningSource:
+    """run_ingest must route each worker session to the source that
+    already owns its project's events, not always to the first source
+    (Codex finding on PR #53: a global sweep into one fixed store would
+    silently split one project's cost data across two databases)."""
+
+    def test_worker_session_for_proj_b_is_ingested_into_instance_b(
+        self,
+        client: TestClient,
+        two_sources: Tuple[Any, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from backend.cost_ingest import clear_project_info_cache
+
+        store_a, store_b = two_sources
+        clear_project_info_cache()
+
+        home = tmp_path / "home"
+        exp_dir = home / "experiment_proj_b"
+        worktree = exp_dir / "worktrees" / "agent_9"
+        worktree.mkdir(parents=True)
+        (exp_dir / "project_info.json").write_text(json.dumps({"project_id": "proj_b"}))
+
+        sess_dir = home / ".claude" / "projects" / "fake"
+        sess_dir.mkdir(parents=True)
+        record = {
+            "type": "assistant",
+            "uuid": "u_routing_1",
+            "sessionId": "s_routing_1",
+            "requestId": "req_routing_1",
+            "timestamp": "2026-05-10T14:00:00.000Z",
+            "cwd": str(worktree),
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 5,
+                },
+            },
+        }
+        (sess_dir / "s.jsonl").write_text(json.dumps(record) + "\n")
+        monkeypatch.setenv("HOME", str(home))
+
+        resp = client.post("/api/cost/ingest")
+        assert resp.status_code == 200
+        assert resp.json()["ingested"] == 1
+
+        in_b = store_b.conn.execute(
+            "SELECT COUNT(*) FROM token_events WHERE request_id = 'req_routing_1'"
+        ).fetchone()[0]
+        in_a = store_a.conn.execute(
+            "SELECT COUNT(*) FROM token_events WHERE request_id = 'req_routing_1'"
+        ).fetchone()[0]
+        assert (
+            in_b == 1
+        ), "worker event for proj_b (owned by instance_b) must land in instance_b"
+        assert in_a == 0, "worker event for proj_b must NOT land in instance_a"
+
+
+@requires_marcus
+class TestBudgetSurvivesSourceMigration:
+    """A budget set before a project has events must not be orphaned once
+    that project's events land in a different configured source (Codex
+    finding on PR #53)."""
+
+    def test_budget_set_before_events_exist_stays_visible_after_events_appear(
+        self, client: TestClient, two_sources: Tuple[Any, Any]
+    ) -> None:
+        store_a, store_b = two_sources
+
+        # proj_new has no events anywhere yet -- budget lands on the first
+        # configured source (instance_a) per _find_owning_store's fallback.
+        put_resp = client.put(
+            "/api/cost/projects/proj_new/budget",
+            json={"budget_usd": 50.0, "note": "set before any events"},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["budget"]["budget_usd"] == 50.0
+
+        # Now proj_new's first event lands on instance_b (a different
+        # source than the one the budget was set on).
+        from src.cost_tracking.cost_store import TokenEvent
+
+        store_b.record_event(
+            TokenEvent(
+                run_id="run_new1",
+                project_id="proj_new",
+                agent_id="agent_1",
+                agent_role="worker",
+                operation="turn",
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                input_tokens=10,
+                output_tokens=5,
+            )
+        )
+
+        get_resp = client.get("/api/cost/projects/proj_new/budget")
+        assert get_resp.json()["budget"]["budget_usd"] == 50.0, (
+            "budget set on instance_a before proj_new had events must still be "
+            "visible after proj_new's events land on instance_b"
+        )
+
+    def test_updating_an_existing_budget_edits_it_in_place_not_a_new_copy(
+        self, client: TestClient, two_sources: Tuple[Any, Any]
+    ) -> None:
+        """proj_b already has events on instance_b; set its budget, then
+        update it, and confirm there is exactly one row, on instance_b."""
+        store_a, store_b = two_sources
+
+        client.put("/api/cost/projects/proj_b/budget", json={"budget_usd": 10.0})
+        client.put("/api/cost/projects/proj_b/budget", json={"budget_usd": 20.0})
+
+        get_resp = client.get("/api/cost/projects/proj_b/budget")
+        assert get_resp.json()["budget"]["budget_usd"] == 20.0
+
+        assert store_a.get_project_budget("proj_b") is None
+        assert store_b.get_project_budget("proj_b") is not None
+
+
+@requires_marcus
+class TestProjectNameResolvedFromOwningSourceOnly:
+    """A conflicting/stale name snapshot on an unrelated, LATER-iterated
+    source must not overwrite the owning (earlier) source's correct name
+    (Codex finding on PR #53: merging every source's name map with
+    dict.update() makes the last-iterated source always win, regardless
+    of which source actually owns the project -- proj_a is owned by
+    instance_a, the FIRST configured source, so a stale override on
+    instance_b (iterated after it) only catches the bug if instance_b's
+    value is wrongly allowed to win)."""
+
+    def test_legacy_summary_uses_owning_sources_name_not_another_sources(
+        self, client: TestClient, two_sources: Tuple[Any, Any]
+    ) -> None:
+        store_a, store_b = two_sources
+        store_a.upsert_project_name("proj_a", "Correct Alpha Name")
+        # instance_b, iterated after instance_a, has a stale/conflicting
+        # snapshot for proj_a's id even though it owns no events for it.
+        store_b.upsert_project_name("proj_a", "Wrong Name From Instance B")
+
+        resp = client.get("/api/cost/projects/proj_a")
+        assert resp.json()["project_name"] == "Correct Alpha Name"
+
+    def test_full_summary_uses_owning_sources_name_not_another_sources(
+        self, client: TestClient, two_sources: Tuple[Any, Any]
+    ) -> None:
+        store_a, store_b = two_sources
+        store_a.upsert_project_name("proj_a", "Correct Alpha Name")
+        store_b.upsert_project_name("proj_a", "Wrong Name From Instance B")
+
+        resp = client.get("/api/cost/projects/proj_a/summary")
+        assert resp.json()["project_name"] == "Correct Alpha Name"
