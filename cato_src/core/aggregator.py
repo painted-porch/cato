@@ -196,11 +196,14 @@ class Aggregator:
         self._events_cache: Optional[List[Dict[str, Any]]] = None
         self._events_cache_signature: Optional[Tuple] = None
 
-        # Lazy-initialized Marcus persistence handle. Reused across calls so
-        # decisions and artifacts share one instance instead of paying the
-        # init cost twice per snapshot.
-        self._persistence: Optional[Any] = None
-        self._persistence_init_attempted: bool = False
+        # Lazy-initialized Marcus persistence handles, keyed by root. Each
+        # root gets its own ProjectHistoryPersistence instance so a project
+        # living in a non-primary root is not served by the primary root's
+        # data (cato#50). Reused across calls within a root so decisions and
+        # artifacts share one instance instead of paying the init cost twice
+        # per snapshot.
+        self._persistence: Dict[str, Optional[Any]] = {}
+        self._persistence_init_attempted: Dict[str, bool] = {}
 
         # mtime-validated cache for subtasks.json (per marcus_root). Reading
         # the full ~5k-entry file is ~150ms; the file is rewritten atomically
@@ -211,26 +214,32 @@ class Aggregator:
 
         logger.info(f"Initialized Aggregator with roots: {self.marcus_roots}")
 
-    def _get_marcus_persistence(self) -> Optional[Any]:
-        """Lazy-load and cache Marcus's ProjectHistoryPersistence instance.
+    def _get_marcus_persistence(self, root: Optional[Path] = None) -> Optional[Any]:
+        """Lazy-load and cache a ProjectHistoryPersistence instance for a given root.
+
+        Cached per root (not globally): a project living in a non-primary
+        root must be served by that root's own persistence instance, not
+        whichever root resolved first (cato#50).
 
         Returns None if Marcus is not importable (e.g. running standalone).
         """
-        if self._persistence is not None or self._persistence_init_attempted:
-            return self._persistence
-        self._persistence_init_attempted = True
+        root = root if root is not None else self.marcus_root
+        key = str(root)
+        if key in self._persistence or self._persistence_init_attempted.get(key):
+            return self._persistence.get(key)
+        self._persistence_init_attempted[key] = True
         try:
             import sys
 
-            if str(self.marcus_root) not in sys.path:
-                sys.path.insert(0, str(self.marcus_root))
+            if key not in sys.path:
+                sys.path.insert(0, key)
             from src.core.project_history import ProjectHistoryPersistence
 
-            self._persistence = ProjectHistoryPersistence()
+            self._persistence[key] = ProjectHistoryPersistence(marcus_root=root)
         except Exception as e:
-            logger.debug(f"Marcus persistence unavailable: {e}")
-            self._persistence = None
-        return self._persistence
+            logger.debug(f"Marcus persistence unavailable for {root}: {e}")
+            self._persistence[key] = None
+        return self._persistence[key]
 
     def _load_subtasks_json_cached(self, root: Path) -> List[Dict[str, Any]]:
         """Read subtasks.json with mtime-validated caching.
@@ -2189,79 +2198,92 @@ class Aggregator:
         """
         decisions: List[Dict[str, Any]] = []
 
-        try:
-            import asyncio
+        # Resolve which root(s) actually own the data being asked for. A
+        # project living in a non-primary root must be read from that root,
+        # not from self.marcus_root (cato#50).
+        if project_id:
+            roots = [self._project_root.get(project_id, self.marcus_root)]
+        else:
+            roots = self.marcus_roots
 
-            persistence = self._get_marcus_persistence()
-            if persistence is None:
-                raise ImportError("Marcus persistence unavailable")
+        for root in roots:
+            try:
+                import asyncio
 
-            def _load_for(pid: str) -> List[Dict[str, Any]]:
-                if project_task_ids is not None and pid == project_id:
-                    with self._override_task_ids(persistence, pid, project_task_ids):
+                persistence = self._get_marcus_persistence(root)
+                if persistence is None:
+                    raise ImportError("Marcus persistence unavailable")
+
+                def _load_for(pid: str) -> List[Dict[str, Any]]:
+                    if project_task_ids is not None and pid == project_id:
+                        with self._override_task_ids(
+                            persistence, pid, project_task_ids
+                        ):
+                            objs = asyncio.run(persistence.load_decisions(pid))
+                    else:
                         objs = asyncio.run(persistence.load_decisions(pid))
+                    return [d.to_dict() for d in objs]
+
+                if project_id:
+                    decisions.extend(_load_for(project_id))
                 else:
-                    objs = asyncio.run(persistence.load_decisions(pid))
-                return [d.to_dict() for d in objs]
+                    # Load every project whose history lives under this root
+                    project_history_dir = root / "data" / "project_history"
+                    if project_history_dir.exists():
+                        for project_dir in project_history_dir.iterdir():
+                            if project_dir.is_dir():
+                                try:
+                                    decisions.extend(_load_for(project_dir.name))
+                                except Exception as e:
+                                    logger.debug(
+                                        "Could not load decisions for "
+                                        f"{project_dir.name}: {e}"
+                                    )
 
-            if project_id:
-                decisions = _load_for(project_id)
-            else:
-                # Load for all projects
-                project_history_dir = self.marcus_root / "data" / "project_history"
-                if project_history_dir.exists():
-                    for project_dir in project_history_dir.iterdir():
-                        if project_dir.is_dir():
-                            try:
-                                decisions.extend(_load_for(project_dir.name))
-                            except Exception as e:
-                                logger.debug(
-                                    "Could not load decisions for "
-                                    f"{project_dir.name}: {e}"
-                                )
-
-        except (ImportError, RuntimeError, Exception) as e:
-            logger.debug(f"Marcus persistence not available or failed: {e}")
+            except (ImportError, RuntimeError, Exception) as e:
+                logger.debug(
+                    f"Marcus persistence not available or failed for {root}: {e}"
+                )
 
         # If no decisions loaded (persistence failed or asyncio.run() failed silently),
-        # fall back to JSON files
+        # fall back to JSON files, again scoped to the owning root(s).
         if not decisions:
             logger.debug("No decisions from persistence, trying JSON fallback")
-            if project_id:
-                json_path = (
-                    self.marcus_root
-                    / "data"
-                    / "project_history"
-                    / project_id
-                    / "decisions.json"
-                )
-                if json_path.exists():
-                    try:
-                        with open(json_path, "r") as f:
-                            data = json.load(f)
-                            decisions = data.get("decisions", [])
-                    except Exception as json_error:
-                        logger.warning(
-                            f"JSON fallback failed for decisions: {json_error}"
-                        )
-            else:
-                # Load all projects from JSON files
-                project_history_dir = self.marcus_root / "data" / "project_history"
-                if project_history_dir.exists():
-                    for project_dir in project_history_dir.iterdir():
-                        if project_dir.is_dir():
-                            json_path = project_dir / "decisions.json"
-                            if json_path.exists():
-                                try:
-                                    with open(json_path, "r") as f:
-                                        data = json.load(f)
-                                        decisions.extend(data.get("decisions", []))
-                                except Exception as json_error:
-                                    logger.debug(
-                                        "Could not load decisions"
-                                        f" from {json_path}:"
-                                        f" {json_error}"
-                                    )
+            for root in roots:
+                if project_id:
+                    json_path = (
+                        root
+                        / "data"
+                        / "project_history"
+                        / project_id
+                        / "decisions.json"
+                    )
+                    if json_path.exists():
+                        try:
+                            with open(json_path, "r") as f:
+                                data = json.load(f)
+                                decisions.extend(data.get("decisions", []))
+                        except Exception as json_error:
+                            logger.warning(
+                                f"JSON fallback failed for decisions: {json_error}"
+                            )
+                else:
+                    project_history_dir = root / "data" / "project_history"
+                    if project_history_dir.exists():
+                        for project_dir in project_history_dir.iterdir():
+                            if project_dir.is_dir():
+                                json_path = project_dir / "decisions.json"
+                                if json_path.exists():
+                                    try:
+                                        with open(json_path, "r") as f:
+                                            data = json.load(f)
+                                            decisions.extend(data.get("decisions", []))
+                                    except Exception as json_error:
+                                        logger.debug(
+                                            "Could not load decisions"
+                                            f" from {json_path}:"
+                                            f" {json_error}"
+                                        )
 
         logger.info(f"Loaded {len(decisions)} decisions")
         return decisions
@@ -2292,79 +2314,90 @@ class Aggregator:
         """
         artifacts: List[Dict[str, Any]] = []
 
-        try:
-            import asyncio
+        # Resolve which root(s) actually own the data being asked for (cato#50).
+        if project_id:
+            roots = [self._project_root.get(project_id, self.marcus_root)]
+        else:
+            roots = self.marcus_roots
 
-            persistence = self._get_marcus_persistence()
-            if persistence is None:
-                raise ImportError("Marcus persistence unavailable")
+        for root in roots:
+            try:
+                import asyncio
 
-            def _load_for(pid: str) -> List[Dict[str, Any]]:
-                if project_task_ids is not None and pid == project_id:
-                    with self._override_task_ids(persistence, pid, project_task_ids):
+                persistence = self._get_marcus_persistence(root)
+                if persistence is None:
+                    raise ImportError("Marcus persistence unavailable")
+
+                def _load_for(pid: str) -> List[Dict[str, Any]]:
+                    if project_task_ids is not None and pid == project_id:
+                        with self._override_task_ids(
+                            persistence, pid, project_task_ids
+                        ):
+                            objs = asyncio.run(persistence.load_artifacts(pid))
+                    else:
                         objs = asyncio.run(persistence.load_artifacts(pid))
+                    return [a.to_dict() for a in objs]
+
+                if project_id:
+                    artifacts.extend(_load_for(project_id))
                 else:
-                    objs = asyncio.run(persistence.load_artifacts(pid))
-                return [a.to_dict() for a in objs]
+                    # Load every project whose history lives under this root
+                    project_history_dir = root / "data" / "project_history"
+                    if project_history_dir.exists():
+                        for project_dir in project_history_dir.iterdir():
+                            if project_dir.is_dir():
+                                try:
+                                    artifacts.extend(_load_for(project_dir.name))
+                                except Exception as e:
+                                    logger.debug(
+                                        "Could not load artifacts for "
+                                        f"{project_dir.name}: {e}"
+                                    )
 
-            if project_id:
-                artifacts = _load_for(project_id)
-            else:
-                # Load for all projects
-                project_history_dir = self.marcus_root / "data" / "project_history"
-                if project_history_dir.exists():
-                    for project_dir in project_history_dir.iterdir():
-                        if project_dir.is_dir():
-                            try:
-                                artifacts.extend(_load_for(project_dir.name))
-                            except Exception as e:
-                                logger.debug(
-                                    "Could not load artifacts for "
-                                    f"{project_dir.name}: {e}"
-                                )
-
-        except (ImportError, RuntimeError, Exception) as e:
-            logger.debug(f"Marcus persistence not available or failed: {e}")
+            except (ImportError, RuntimeError, Exception) as e:
+                logger.debug(
+                    f"Marcus persistence not available or failed for {root}: {e}"
+                )
 
         # If no artifacts loaded (persistence failed or asyncio.run() failed silently),
-        # fall back to JSON files
+        # fall back to JSON files, again scoped to the owning root(s).
         if not artifacts:
             logger.debug("No artifacts from persistence, trying JSON fallback")
-            if project_id:
-                json_path = (
-                    self.marcus_root
-                    / "data"
-                    / "project_history"
-                    / project_id
-                    / "artifacts.json"
-                )
-                if json_path.exists():
-                    try:
-                        with open(json_path, "r") as f:
-                            data = json.load(f)
-                            artifacts = data.get("artifacts", [])
-                    except Exception as json_error:
-                        logger.warning(
-                            f"JSON fallback failed for artifacts: {json_error}"
-                        )
-            else:
-                # Load all projects from JSON files
-                project_history_dir = self.marcus_root / "data" / "project_history"
-                if project_history_dir.exists():
-                    for project_dir in project_history_dir.iterdir():
-                        if project_dir.is_dir():
-                            json_path = project_dir / "artifacts.json"
-                            if json_path.exists():
-                                try:
-                                    with open(json_path, "r") as f:
-                                        data = json.load(f)
-                                        artifacts.extend(data.get("artifacts", []))
-                                except Exception as json_error:
-                                    logger.debug(
-                                        "Could not load artifacts"
-                                        f" from {json_path}:"
-                                        f" {json_error}"
-                                    )
+            for root in roots:
+                if project_id:
+                    json_path = (
+                        root
+                        / "data"
+                        / "project_history"
+                        / project_id
+                        / "artifacts.json"
+                    )
+                    if json_path.exists():
+                        try:
+                            with open(json_path, "r") as f:
+                                data = json.load(f)
+                                artifacts.extend(data.get("artifacts", []))
+                        except Exception as json_error:
+                            logger.warning(
+                                f"JSON fallback failed for artifacts: {json_error}"
+                            )
+                else:
+                    project_history_dir = root / "data" / "project_history"
+                    if project_history_dir.exists():
+                        for project_dir in project_history_dir.iterdir():
+                            if project_dir.is_dir():
+                                json_path = project_dir / "artifacts.json"
+                                if json_path.exists():
+                                    try:
+                                        with open(json_path, "r") as f:
+                                            data = json.load(f)
+                                            artifacts.extend(data.get("artifacts", []))
+                                    except Exception as json_error:
+                                        logger.debug(
+                                            "Could not load artifacts"
+                                            f" from {json_path}:"
+                                            f" {json_error}"
+                                        )
 
         logger.info(f"Loaded {len(artifacts)} artifacts")
         return artifacts
