@@ -131,21 +131,52 @@ def _default_db_path() -> Path:
 def _configured_cost_db_paths(
     config_path: Optional[Path] = None,
 ) -> Optional[List[str]]:
-    """Read ``cost_db_paths`` from ``config.json``, or None if absent/unreadable.
+    """Read ``cost_db_paths`` from ``config.json``, or None if absent/invalid.
+
+    Validates the shape rather than trusting it blindly: a bare string
+    (instead of a list) would otherwise be iterated character-by-character
+    by the caller, producing one bogus source per character, and a
+    malformed ``config.json`` would otherwise fall back to the single-
+    source default *silently* -- which is exactly the "invisible spend,
+    no warning" failure this feature exists to fix (claude-review
+    finding on PR #53).
 
     Parameters
     ----------
     config_path : Optional[Path]
         Override for tests; defaults to Cato's real ``config.json``
         (sibling of ``backend/``, same file ``marcus_data_paths`` lives in).
+
+    Returns
+    -------
+    Optional[List[str]]
+        The configured paths, or None (logged) when absent, unreadable,
+        or not a list of strings.
     """
     path = config_path or (Path(__file__).parent.parent / "config.json")
     try:
         with open(path) as f:
-            result: Optional[List[str]] = json.load(f).get("cost_db_paths")
-            return result
-    except (OSError, json.JSONDecodeError):
+            raw = json.load(f).get("cost_db_paths")
+    except OSError:
         return None
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "config.json is not valid JSON (%s); using a single cost source: %s",
+            path,
+            exc,
+        )
+        return None
+
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+        logger.warning(
+            "config.json's cost_db_paths must be a list of strings, got %r; "
+            "cost falls back to single-source default",
+            raw,
+        )
+        return None
+    return raw
 
 
 def _cost_sources(config_path: Optional[Path] = None) -> List[Tuple[str, Path]]:
@@ -156,20 +187,35 @@ def _cost_sources(config_path: Optional[Path] = None) -> List[Tuple[str, Path]]:
     instance, the same pattern ``marcus_data_paths`` already uses for
     tasks/decisions/artifacts (cato#50 / #51). Falls back to the historical
     single ``MARCUS_COST_DB`` env var / ``~/.marcus/costs.db`` default when
-    ``cost_db_paths`` is absent or empty, so single-instance deployments and
-    existing tests (which override ``get_store``/``get_aggregator``
+    ``cost_db_paths`` is absent or invalid, so single-instance deployments
+    and existing tests (which override ``get_store``/``get_aggregator``
     directly) are unaffected (cato#52).
+
+    Each path is expanded (``~`` → home directory, same as
+    ``marcus_data_paths``'s convention) and resolved to an absolute form
+    before deduplicating, so two spellings of the same file don't double-
+    count rows in every merged endpoint (claude-review finding on PR #53).
 
     Returns
     -------
     List[Tuple[str, Path]]
         ``(source_label, db_path)`` pairs. The label is the configured path
-        string itself, used to tag merged rows by source instance.
+        string itself (post-expansion), used to tag merged rows by source
+        instance.
     """
     configured = _configured_cost_db_paths(config_path)
-    if configured:
-        return [(str(p), Path(p)) for p in configured]
-    return [(str(_default_db_path()), _default_db_path())]
+    if not configured:
+        return [(str(_default_db_path()), _default_db_path())]
+
+    seen: set = set()
+    sources: List[Tuple[str, Path]] = []
+    for raw_path in configured:
+        resolved = Path(raw_path).expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        sources.append((str(resolved), resolved))
+    return sources
 
 
 def get_store() -> Any:

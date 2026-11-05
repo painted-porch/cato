@@ -199,12 +199,27 @@ def run_ingest(stores: List[Tuple[str, Any]]) -> Dict[str, Any]:
 
     aggregators = [CostAggregator(store=store) for _, store in stores]
 
+    # Memoized per project_id for this sweep only: many session files
+    # belong to the same project, and re-running project_totals against
+    # every configured source (including a large production DB) for
+    # every file would turn one sweep into files × sources queries
+    # instead of distinct_projects × sources (claude-review finding on
+    # PR #53). The cache does not persist across sweeps -- a project
+    # can only move source by actually accumulating events there, which
+    # changes what the next sweep's fresh cache would find anyway.
+    _owning_store_cache: Dict[str, Any] = {}
+
     def _owning_store(project_id: str) -> Any:
+        if project_id in _owning_store_cache:
+            return _owning_store_cache[project_id]
+        result = stores[0][1]
         for agg, (_, store) in zip(aggregators, stores):
             totals = agg.project_totals(project_id)
             if (totals.get("events") or 0) > 0:
-                return store
-        return stores[0][1]
+                result = store
+                break
+        _owning_store_cache[project_id] = result
+        return result
 
     skipped_unbound = 0
 
@@ -227,12 +242,17 @@ def run_ingest(stores: List[Tuple[str, Any]]) -> Dict[str, Any]:
     files = 0
     for jsonl in base.rglob("*.jsonl"):
         files += 1
-        project_id = _peek_project_id(jsonl)
-        target_store = _owning_store(project_id) if project_id else stores[0][1]
-        ingester = ingesters[id(target_store)]
         try:
+            project_id = _peek_project_id(jsonl)
+            target_store = _owning_store(project_id) if project_id else stores[0][1]
+            ingester = ingesters[id(target_store)]
             ingested += ingester.ingest_file(jsonl)
         except Exception:
+            # One malformed/corrupt file (e.g. invalid UTF-8 from
+            # _peek_project_id, which only guards OSError/JSON errors
+            # itself) must not abort the whole sweep -- every other
+            # session still needs to be ingested on this and every
+            # later poll (Codex finding on PR #53's fix commit).
             logger.exception("ingest failed for %s", jsonl)
             continue
 

@@ -155,6 +155,77 @@ class TestConfiguredSources:
         labels = [label for label, _ in sources]
         assert labels == ["/instance_a/costs.db", "/instance_b/costs.db"]
 
+    def test_string_instead_of_list_does_not_iterate_characters(
+        self, tmp_path: Path
+    ) -> None:
+        """A bare string value must not be iterated character-by-character
+        into one bogus source per character (claude-review finding on
+        PR #53)."""
+        from backend.cost_routes import _cost_sources
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"cost_db_paths": "/instance_a/costs.db"}))
+        sources = _cost_sources(config_path=config_path)
+        assert len(sources) == 1, f"expected fallback to one source, got {sources!r}"
+
+    def test_non_string_entries_reject_the_whole_list(self, tmp_path: Path) -> None:
+        """A list containing a non-string entry falls back rather than crashing
+        or silently mis-resolving (claude-review finding on PR #53)."""
+        from backend.cost_routes import _cost_sources
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"cost_db_paths": ["/a/costs.db", 42]}))
+        sources = _cost_sources(config_path=config_path)
+        assert len(sources) == 1
+
+    def test_malformed_json_logs_a_warning_not_silent_fallback(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A malformed config.json must not silently fall back to one source --
+        that's the exact 'invisible spend, no warning' failure this feature
+        exists to fix (claude-review finding on PR #53)."""
+        from backend.cost_routes import _cost_sources
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text("{not valid json")
+        with caplog.at_level("WARNING"):
+            sources = _cost_sources(config_path=config_path)
+        assert len(sources) == 1
+        assert any("not valid JSON" in r.message for r in caplog.records)
+
+    def test_tilde_is_expanded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ~/... entry must expand to the real home directory, matching
+        marcus_data_paths's own convention (claude-review finding on PR #53)."""
+        from backend.cost_routes import _cost_sources
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"cost_db_paths": ["~/mine/costs.db"]}))
+        sources = _cost_sources(config_path=config_path)
+        assert sources[0][1] == (tmp_path / "mine" / "costs.db").resolve()
+
+    def test_duplicate_paths_are_deduped(self, tmp_path: Path) -> None:
+        """Two spellings of the same path must not double-count rows in every
+        merged endpoint (claude-review finding on PR #53)."""
+        from backend.cost_routes import _cost_sources
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "cost_db_paths": [
+                        "/instance_a/costs.db",
+                        "/instance_a/costs.db",
+                        "/instance_b/costs.db",
+                    ]
+                }
+            )
+        )
+        sources = _cost_sources(config_path=config_path)
+        assert len(sources) == 2
+
 
 @requires_marcus
 class TestListProjectsMultiSource:
@@ -347,6 +418,137 @@ class TestIngestRoutesToOwningSource:
             in_b == 1
         ), "worker event for proj_b (owned by instance_b) must land in instance_b"
         assert in_a == 0, "worker event for proj_b must NOT land in instance_a"
+
+    def test_a_malformed_file_does_not_abort_the_rest_of_the_sweep(
+        self,
+        client: TestClient,
+        two_sources: Tuple[Any, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-UTF-8 file raises inside _peek_project_id before reaching
+        ingest_file's own try/except; that must still be caught per-file,
+        not abort every later file in the sweep (claude-review finding on
+        PR #53's fix commit)."""
+        from backend.cost_ingest import clear_project_info_cache
+
+        store_a, store_b = two_sources
+        clear_project_info_cache()
+
+        home = tmp_path / "home"
+        exp_dir = home / "experiment_proj_b"
+        worktree = exp_dir / "worktrees" / "agent_9"
+        worktree.mkdir(parents=True)
+        (exp_dir / "project_info.json").write_text(json.dumps({"project_id": "proj_b"}))
+
+        sess_dir = home / ".claude" / "projects" / "fake"
+        sess_dir.mkdir(parents=True)
+
+        # A file that is not valid UTF-8 -- sorts before "good.jsonl" so it
+        # is processed first by rglob's lexical order.
+        (sess_dir / "bad.jsonl").write_bytes(b"\xff\xfe not utf-8 at all")
+
+        good_record = {
+            "type": "assistant",
+            "uuid": "u_isolation_1",
+            "sessionId": "s_isolation_1",
+            "requestId": "req_isolation_1",
+            "timestamp": "2026-05-10T14:00:00.000Z",
+            "cwd": str(worktree),
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 5,
+                },
+            },
+        }
+        (sess_dir / "good.jsonl").write_text(json.dumps(good_record) + "\n")
+        monkeypatch.setenv("HOME", str(home))
+
+        resp = client.post("/api/cost/ingest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["files"] == 2
+        assert (
+            body["ingested"] == 1
+        ), "the good file must still be ingested despite the bad one"
+
+        count = store_b.conn.execute(
+            "SELECT COUNT(*) FROM token_events WHERE request_id = 'req_isolation_1'"
+        ).fetchone()[0]
+        assert count == 1
+
+
+@requires_marcus
+class TestIngestCachesOwningStoreWithinOneSweep:
+    """_owning_store's project_totals lookups must be memoized per project_id
+    for the duration of one sweep, not re-run against every source for
+    every file (claude-review finding on PR #53's fix commit: many
+    session files belong to the same project)."""
+
+    def test_three_files_for_the_same_project_query_totals_once_per_source(
+        self,
+        two_sources: Tuple[Any, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from src.cost_tracking.cost_aggregator import CostAggregator
+
+        from backend.cost_ingest import clear_project_info_cache, run_ingest
+
+        store_a, store_b = two_sources
+        clear_project_info_cache()
+
+        home = tmp_path / "home"
+        exp_dir = home / "experiment_proj_b"
+        worktree = exp_dir / "worktrees" / "agent_9"
+        worktree.mkdir(parents=True)
+        (exp_dir / "project_info.json").write_text(json.dumps({"project_id": "proj_b"}))
+
+        sess_dir = home / ".claude" / "projects" / "fake"
+        sess_dir.mkdir(parents=True)
+        for i in range(3):
+            record = {
+                "type": "assistant",
+                "uuid": f"u_cache_{i}",
+                "sessionId": f"s_cache_{i}",
+                "requestId": f"req_cache_{i}",
+                "timestamp": "2026-05-10T14:00:00.000Z",
+                "cwd": str(worktree),
+                "message": {
+                    "model": "claude-sonnet-4-6",
+                    "usage": {
+                        "input_tokens": 10,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 5,
+                    },
+                },
+            }
+            (sess_dir / f"s{i}.jsonl").write_text(json.dumps(record) + "\n")
+        monkeypatch.setenv("HOME", str(home))
+
+        calls = []
+        real_project_totals = CostAggregator.project_totals
+
+        def _counting_project_totals(self: Any, project_id: str) -> Any:
+            calls.append(project_id)
+            return real_project_totals(self, project_id)
+
+        monkeypatch.setattr(CostAggregator, "project_totals", _counting_project_totals)
+
+        result = run_ingest([("instance_a", store_a), ("instance_b", store_b)])
+        assert result["ingested"] == 3
+
+        # 3 files, 1 distinct project, 2 sources -- memoized means at most
+        # 2 calls (one per source, for the single distinct project_id),
+        # not 3 files x 2 sources = 6.
+        assert (
+            len(calls) <= 2
+        ), f"expected at most 2 project_totals calls, got {len(calls)}: {calls}"
 
 
 @requires_marcus
