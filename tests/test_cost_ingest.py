@@ -168,7 +168,7 @@ class TestRunIngest:
         target.parent.mkdir(parents=True)
         sess_dir.rename(target)
 
-        result = run_ingest(store)
+        result = run_ingest([("default", store)])
         assert result["ingested"] == 1
         assert result["files"] == 1
         assert result["skipped_unbound"] == 0
@@ -177,7 +177,11 @@ class TestRunIngest:
             "SELECT project_id, agent_id, input_tokens, output_tokens "
             "FROM token_events"
         ).fetchone()
-        assert row == ("proj_42", "agent_1", 100, 50)
+        # run_ingest's per-project ownership check (cato#52) instantiates a
+        # CostAggregator, which sets store.conn.row_factory = sqlite3.Row as
+        # a side effect -- compare via tuple() so this doesn't depend on
+        # which row type the shared connection happens to be using.
+        assert tuple(row) == ("proj_42", "agent_1", 100, 50)
 
     def test_run_ingest_is_idempotent_across_calls(
         self,
@@ -216,8 +220,8 @@ class TestRunIngest:
         (sess_dir / "s1.jsonl").write_text(json.dumps(record) + "\n")
         monkeypatch.setenv("HOME", str(tmp_path))
 
-        first = run_ingest(store)
-        second = run_ingest(store)
+        first = run_ingest([("default", store)])
+        second = run_ingest([("default", store)])
 
         assert first["ingested"] == 1
         # Second sweep may report ingested>0 from the library's perspective,
@@ -236,5 +240,5 @@ class TestRunIngest:
     ) -> None:
         """No ~/.claude/projects/ dir → graceful zero return, no error."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        result = run_ingest(store)
+        result = run_ingest([("default", store)])
         assert result == {"ingested": 0, "files": 0, "skipped_unbound": 0}

@@ -35,7 +35,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -120,18 +120,111 @@ def _default_db_path() -> Path:
     """Return the default cost DB path Marcus uses (``~/.marcus/costs.db``).
 
     Override with the ``MARCUS_COST_DB`` env var in tests / non-default
-    deployments.
+    deployments. Used only as the fallback single source when
+    ``cost_db_paths`` is not configured; see :func:`_cost_sources`.
     """
     return Path(
         os.environ.get("MARCUS_COST_DB", str(Path.home() / ".marcus" / "costs.db"))
     )
 
 
+def _configured_cost_db_paths(
+    config_path: Optional[Path] = None,
+) -> Optional[List[str]]:
+    """Read ``cost_db_paths`` from ``config.json``, or None if absent/invalid.
+
+    Validates the shape rather than trusting it blindly: a bare string
+    (instead of a list) would otherwise be iterated character-by-character
+    by the caller, producing one bogus source per character, and a
+    malformed ``config.json`` would otherwise fall back to the single-
+    source default *silently* -- which is exactly the "invisible spend,
+    no warning" failure this feature exists to fix (claude-review
+    finding on PR #53).
+
+    Parameters
+    ----------
+    config_path : Optional[Path]
+        Override for tests; defaults to Cato's real ``config.json``
+        (sibling of ``backend/``, same file ``marcus_data_paths`` lives in).
+
+    Returns
+    -------
+    Optional[List[str]]
+        The configured paths, or None (logged) when absent, unreadable,
+        or not a list of strings.
+    """
+    path = config_path or (Path(__file__).parent.parent / "config.json")
+    try:
+        with open(path) as f:
+            raw = json.load(f).get("cost_db_paths")
+    except OSError:
+        return None
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "config.json is not valid JSON (%s); using a single cost source: %s",
+            path,
+            exc,
+        )
+        return None
+
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+        logger.warning(
+            "config.json's cost_db_paths must be a list of strings, got %r; "
+            "cost falls back to single-source default",
+            raw,
+        )
+        return None
+    return raw
+
+
+def _cost_sources(config_path: Optional[Path] = None) -> List[Tuple[str, Path]]:
+    """Resolve every cost DB this Cato instance should read, in order.
+
+    Marcus can run several isolated instances at once, each with its own
+    cost database. ``cost_db_paths`` in ``config.json`` lists one path per
+    instance, the same pattern ``marcus_data_paths`` already uses for
+    tasks/decisions/artifacts (cato#50 / #51). Falls back to the historical
+    single ``MARCUS_COST_DB`` env var / ``~/.marcus/costs.db`` default when
+    ``cost_db_paths`` is absent or invalid, so single-instance deployments
+    and existing tests (which override ``get_store``/``get_aggregator``
+    directly) are unaffected (cato#52).
+
+    Each path is expanded (``~`` → home directory, same as
+    ``marcus_data_paths``'s convention) and resolved to an absolute form
+    before deduplicating, so two spellings of the same file don't double-
+    count rows in every merged endpoint (claude-review finding on PR #53).
+
+    Returns
+    -------
+    List[Tuple[str, Path]]
+        ``(source_label, db_path)`` pairs. The label is the configured path
+        string itself (post-expansion), used to tag merged rows by source
+        instance.
+    """
+    configured = _configured_cost_db_paths(config_path)
+    if not configured:
+        return [(str(_default_db_path()), _default_db_path())]
+
+    seen: set = set()
+    sources: List[Tuple[str, Path]] = []
+    for raw_path in configured:
+        resolved = Path(raw_path).expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        sources.append((str(resolved), resolved))
+    return sources
+
+
 def get_store() -> Any:
-    """Yield a :class:`CostStore` instance (FastAPI dependency).
+    """Yield a :class:`CostStore` for the first configured cost source.
 
     Tests override this via ``app.dependency_overrides`` to point at a
-    tmp database.
+    tmp database. Write endpoints (budget, prices, ingest) that don't yet
+    know which instance owns a given project keep using this single-store
+    form; see :func:`get_stores` for the multi-source read path.
 
     Raises
     ------
@@ -143,12 +236,82 @@ def get_store() -> Any:
             status_code=503,
             detail="Marcus cost_tracking modules are not available",
         )
-    return CostStore(db_path=_default_db_path())
+    return CostStore(db_path=_cost_sources()[0][1])
+
+
+def get_stores() -> List[Tuple[str, Any]]:
+    """Build one :class:`CostStore` per configured cost source (dependency).
+
+    Returns
+    -------
+    List[Tuple[str, Any]]
+        ``(source_label, store)`` pairs, one per entry in
+        :func:`_cost_sources`.
+
+    Raises
+    ------
+    HTTPException
+        503 if Marcus's cost_tracking modules are not importable.
+    """
+    if not COST_TRACKING_AVAILABLE or CostStore is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Marcus cost_tracking modules are not available",
+        )
+    return [(label, CostStore(db_path=path)) for label, path in _cost_sources()]
 
 
 def get_aggregator(store: Any = Depends(get_store)) -> Any:
-    """Yield a :class:`CostAggregator` (FastAPI dependency)."""
+    """Yield a :class:`CostAggregator` for the first configured source."""
     return CostAggregator(store=store)
+
+
+def get_aggregators(
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
+) -> List[Tuple[str, Any]]:
+    """One :class:`CostAggregator` per configured source, paired with its label."""
+    return [(label, CostAggregator(store=store)) for label, store in stores]
+
+
+def _find_owning_store(
+    project_id: str,
+    aggregators: List[Tuple[str, Any]],
+    stores: List[Tuple[str, Any]],
+) -> Any:
+    """Return the store whose cost DB actually has events for this project.
+
+    Falls back to the first configured store when the project has no
+    events anywhere yet (e.g. setting a budget before any run happens),
+    matching the pre-#52 single-source behavior for that case.
+    """
+    for (_, agg), (_, store) in zip(aggregators, stores):
+        totals = agg.project_totals(project_id)
+        if (totals.get("events") or 0) > 0:
+            return store
+    return stores[0][1]
+
+
+def _find_budget_store(
+    project_id: str,
+    aggregators: List[Tuple[str, Any]],
+    stores: List[Tuple[str, Any]],
+) -> Any:
+    """Return the store holding this project's existing budget cap, if any.
+
+    A budget set before a project has any cost events lives wherever
+    :func:`_find_owning_store` happened to default to at that time (the
+    first configured source). Once the project's events subsequently
+    land in a *different* source, ``_find_owning_store`` alone would
+    silently switch budget reads/writes to that source too, orphaning
+    the original cap (cato#52, Codex finding on PR #53). Checking every
+    source for an existing budget row first, before falling back to the
+    events-owning source, keeps a previously accepted cap visible and
+    editable no matter which source its events end up on.
+    """
+    for _, store in stores:
+        if store.get_project_budget(project_id) is not None:
+            return store
+    return _find_owning_store(project_id, aggregators, stores)
 
 
 # ---------------------------------------------------------------------------
@@ -317,25 +480,28 @@ router = APIRouter(prefix="/api/cost", tags=["cost"])
 
 @router.post("/ingest")  # type: ignore[misc]
 def trigger_ingest(
-    store: Any = Depends(get_store),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """Sweep ``~/.claude/projects/`` and ingest any new worker session events.
 
     Marcus's :class:`WorkerJSONLIngester` is idempotent (UUID-dedupes
-    per process) so calling this on every dashboard load is safe.
+    per process) so calling this on every dashboard load is safe. Each
+    session is routed to whichever configured source already owns its
+    project (cato#52), so worker events never land in a different
+    database than that project's planner events.
     Returns a small summary so the UI can show "X new events ingested
     from Y files" if it wants.
     """
     from backend.cost_ingest import run_ingest
 
-    return run_ingest(store)
+    return run_ingest(stores)
 
 
 @router.get("/projects")  # type: ignore[misc]
 def list_projects(
     limit: int = Query(100, ge=1, le=1000),
-    aggregator: Any = Depends(get_aggregator),
-    store: Any = Depends(get_store),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """List every project that has cost activity, sorted by spend desc.
 
@@ -345,19 +511,30 @@ def list_projects(
     activity timestamps. Excludes the ``'unassigned'`` bucket — surfaced
     separately via ``/api/cost/projects/unassigned``.
 
+    Merges rows across every configured cost source (cato#52), tagging
+    each with ``source`` so a project on one Marcus instance is never
+    silently indistinguishable from one on another.
+
     Parameters
     ----------
     limit : int
         Cap at 1000. Default 100.
     """
-    rows = aggregator.list_projects(limit=limit)
-    _enrich_project_names(rows, store=store)
+    rows: List[Dict[str, Any]] = []
+    for (label, agg), (_, store) in zip(aggregators, stores):
+        source_rows = agg.list_projects(limit=limit)
+        _enrich_project_names(source_rows, store=store)
+        for row in source_rows:
+            row["source"] = label
+        rows.extend(source_rows)
+    rows.sort(key=lambda r: r.get("total_cost_usd") or 0, reverse=True)
+    rows = rows[:limit]
     return {"projects": rows, "count": len(rows)}
 
 
 @router.get("/projects/unassigned")  # type: ignore[misc]
 def unassigned_totals(
-    aggregator: Any = Depends(get_aggregator),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
 ) -> Dict[str, Any]:
     """Cost of LLM calls Marcus made without an active PlannerContext.
 
@@ -365,8 +542,15 @@ def unassigned_totals(
     the gap is observable rather than silent. A high number here means
     a code path is making LLM calls outside the MCP request lifecycle
     (or a project-creation tool ran without a target project_id).
+
+    Summed across every configured cost source (cato#52).
     """
-    totals: Dict[str, Any] = aggregator.unassigned_totals()
+    totals: Dict[str, Any] = {"events": 0, "total_tokens": 0, "total_cost_usd": 0.0}
+    for _, agg in aggregators:
+        part = agg.unassigned_totals()
+        totals["events"] += part.get("events") or 0
+        totals["total_tokens"] += part.get("total_tokens") or 0
+        totals["total_cost_usd"] += part.get("total_cost_usd") or 0.0
     return totals
 
 
@@ -374,7 +558,7 @@ def unassigned_totals(
 def list_runs(
     project_id: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
-    aggregator: Any = Depends(get_aggregator),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
 ) -> Dict[str, Any]:
     """List runs with token + cost totals attached.
 
@@ -383,6 +567,9 @@ def list_runs(
     clashed with MLflow's separate concept; ``run`` accurately
     describes a single project traversal.
 
+    Merges rows across every configured cost source (cato#52), tagging
+    each with ``source``.
+
     Parameters
     ----------
     project_id : str, optional
@@ -390,14 +577,21 @@ def list_runs(
     limit : int
         Cap at 1000. Default 100.
     """
-    rows = aggregator.list_runs(project_id=project_id, limit=limit)
+    rows: List[Dict[str, Any]] = []
+    for label, agg in aggregators:
+        source_rows = agg.list_runs(project_id=project_id, limit=limit)
+        for row in source_rows:
+            row["source"] = label
+        rows.extend(source_rows)
+    rows.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+    rows = rows[:limit]
     return {"runs": rows, "count": len(rows)}
 
 
 @router.get("/runs/{run_id}")  # type: ignore[misc]
 def run_summary(
     run_id: str,
-    aggregator: Any = Depends(get_aggregator),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
 ) -> Dict[str, Any]:
     """Full per-run breakdown (summary + by_role / agent / task / etc.).
 
@@ -406,49 +600,80 @@ def run_summary(
 
     Renamed from ``/experiments/{experiment_id}``.
 
+    Searches every configured cost source in order and returns the
+    first match (cato#52) — run_ids are unique per Marcus instance, so
+    at most one source will ever have a given run.
+
     Raises
     ------
     HTTPException
-        404 if the run does not exist.
+        404 if the run does not exist on any configured source.
     """
-    summary: Optional[Dict[str, Any]] = aggregator.run_summary(run_id)
-    if summary is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return summary
+    for _, agg in aggregators:
+        summary: Optional[Dict[str, Any]] = agg.run_summary(run_id)
+        if summary is not None:
+            return summary
+    raise HTTPException(status_code=404, detail="run not found")
 
 
 @router.get("/projects/{project_id}")  # type: ignore[misc]
 def project_summary(
     project_id: str,
-    aggregator: Any = Depends(get_aggregator),
-    store: Any = Depends(get_store),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """Project rollup + list of run summaries.
 
     Legacy thin shape kept for backwards compatibility with the old
     project picker; the project-first dashboard tabs use
     ``/projects/{id}/summary`` for the full per-project breakdown.
+
+    Searches every configured cost source for the one owning this
+    project (cato#52); falls back to the first source's zero totals
+    when the project has no events anywhere, preserving the pre-#52
+    response shape for an unknown project_id. Resolves ``project_name``
+    from that same matched source only -- merging every source's name
+    map would let an unrelated source's stale registry entry overwrite
+    the owning source's correct snapshot name (cato#52, Codex finding
+    on PR #53).
     """
-    names = _load_project_names(store=store)
+    for (_, agg), (_, store) in zip(aggregators, stores):
+        totals = agg.project_totals(project_id)
+        if (totals.get("events") or 0) > 0:
+            names = _load_project_names(store=store)
+            return {
+                "project_id": project_id,
+                "project_name": names.get(project_id),
+                "totals": totals,
+                "runs": agg.list_runs(project_id=project_id),
+            }
+
+    _, first_agg = aggregators[0]
+    _, first_store = stores[0]
+    names = _load_project_names(store=first_store)
     return {
         "project_id": project_id,
         "project_name": names.get(project_id),
-        "totals": aggregator.project_totals(project_id),
-        "runs": aggregator.list_runs(project_id=project_id),
+        "totals": first_agg.project_totals(project_id),
+        "runs": first_agg.list_runs(project_id=project_id),
     }
 
 
 @router.get("/projects/{project_id}/budget")  # type: ignore[misc]
 def get_project_budget(
     project_id: str,
-    store: Any = Depends(get_store),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """Return the budget cap set for a project, or null if none.
 
     Surfaced to the dashboard's Budget tab so it can render
     spend-vs-cap when a ceiling is set, falling back to spend-only
-    when not.
+    when not. Reads from whichever configured source actually holds
+    this project's budget row, or owns its cost events if no budget
+    has been set yet (cato#52).
     """
+    store = _find_budget_store(project_id, aggregators, stores)
     row = store.get_project_budget(project_id)
     return {"project_id": project_id, "budget": row}
 
@@ -457,14 +682,21 @@ def get_project_budget(
 def put_project_budget(
     project_id: str,
     payload: ProjectBudgetRequest,
-    store: Any = Depends(get_store),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """Set or clear a project's budget cap.
 
     Idempotent upsert on Marcus's side; the cap survives Cato
     restarts because it's persisted to costs.db. Passing
-    ``budget_usd <= 0`` clears the cap (deletes the row).
+    ``budget_usd <= 0`` clears the cap (deletes the row). Written to
+    whichever configured source already holds this project's budget
+    row, so an update or clear always lands on the existing cap
+    rather than silently creating an orphaned one elsewhere; falls
+    back to whichever source owns the project's cost events, or the
+    first configured source, when no budget has been set yet (cato#52).
     """
+    store = _find_budget_store(project_id, aggregators, stores)
     store.set_project_budget(
         project_id=project_id,
         budget_usd=payload.budget_usd,
@@ -477,8 +709,8 @@ def put_project_budget(
 @router.get("/projects/{project_id}/summary")  # type: ignore[misc]
 def project_full_summary(
     project_id: str,
-    aggregator: Any = Depends(get_aggregator),
-    store: Any = Depends(get_store),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> Dict[str, Any]:
     """Full per-project breakdown — drives Real-time/Historical/Budget tabs.
 
@@ -488,27 +720,41 @@ def project_full_summary(
     Project-name is overlaid from Marcus's project_names snapshot
     (PR #515) with fallback to projects.json.
 
+    Searches every configured cost source in order and returns the
+    first match (cato#52). Resolves ``project_name`` from that same
+    matched source only -- merging every source's name map would let
+    an unrelated source's stale registry entry overwrite the owning
+    source's correct snapshot name (cato#52, Codex finding on PR #53).
+
     Raises
     ------
     HTTPException
-        404 if the project has no token events.
+        404 if the project has no token events on any configured source.
     """
-    summary: Optional[Dict[str, Any]] = aggregator.project_summary(project_id)
-    if summary is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    names = _load_project_names(store=store)
-    summary["project_name"] = names.get(project_id)
-    return summary
+    for (_, agg), (_, store) in zip(aggregators, stores):
+        summary: Optional[Dict[str, Any]] = agg.project_summary(project_id)
+        if summary is not None:
+            names = _load_project_names(store=store)
+            summary["project_name"] = names.get(project_id)
+            return summary
+    raise HTTPException(status_code=404, detail="project not found")
 
 
 @router.get("/sessions/{session_id}/turns")  # type: ignore[misc]
 def session_turns(
     session_id: str,
-    aggregator: Any = Depends(get_aggregator),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
 ) -> Dict[str, Any]:
-    """Per-turn cost trajectory for one Claude Code session."""
-    turns = aggregator.session_turns(session_id)
-    return {"session_id": session_id, "turns": turns}
+    """Per-turn cost trajectory for one Claude Code session.
+
+    Searches every configured cost source in order and returns the
+    first non-empty result (cato#52).
+    """
+    for _, agg in aggregators:
+        turns = agg.session_turns(session_id)
+        if turns:
+            return {"session_id": session_id, "turns": turns}
+    return {"session_id": session_id, "turns": []}
 
 
 # -- pricing endpoints -------------------------------------------------------
@@ -656,9 +902,21 @@ def create_price(
 @router.get("/export/{run_id}")  # type: ignore[misc]
 def export_run_csv(
     run_id: str,
-    store: Any = Depends(get_store),
+    aggregators: List[Tuple[str, Any]] = Depends(get_aggregators),
+    stores: List[Tuple[str, Any]] = Depends(get_stores),
 ) -> StreamingResponse:
-    """CSV export of every ``token_events`` row for one run."""
+    """CSV export of every ``token_events`` row for one run.
+
+    Searches every configured cost source for the one owning this run
+    (cato#52), falling back to the first source if none has it (the
+    export will simply come back empty, matching the old single-source
+    behavior for an unknown run_id).
+    """
+    store = stores[0][1]
+    for (_, agg), (_, candidate) in zip(aggregators, stores):
+        if agg.run_summary(run_id) is not None:
+            store = candidate
+            break
     cursor = store.conn.execute(
         """
         SELECT event_id, timestamp, agent_id, agent_role, operation,
