@@ -10,6 +10,24 @@ minimum compatible Marcus version.
 
 ## [Unreleased]
 
+### Changed
+- **The Marcus install path is now configurable per machine.** Cato previously
+  hardcoded `/Users/lwgray/dev/marcus` in several places, making it unusable by
+  anyone else. The Marcus location is now resolved dynamically: the `MARCUS_ROOT`
+  environment variable, then `config.local.json` / `config.json`, then
+  auto-detection (Marcus as a sibling of Cato, or `~/dev/marcus`). On first
+  `./cato start`, the CLI prompts for the Marcus root, validates that it
+  contains both `data/` and `src/`, and saves it to `config.local.json`
+  (gitignored); subsequent starts reuse it silently.
+- **`Aggregator` auto-detection now uses the shared resolver.** Its previous
+  fallback assumed Cato was a subdirectory of Marcus (a leftover from when
+  Cato lived in the Marcus repo) and silently pointed at the Cato root.
+
+### Fixed
+- **Cato now fails loudly when Marcus cannot be located** instead of serving
+  an empty dashboard. A no-arg `Aggregator()` and backend startup raise a
+  clear error directing the user to set `MARCUS_ROOT` or run `./cato`.
+
 ## [0.3.4] - 2026-05-17
 
 Bugfix release.

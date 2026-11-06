@@ -6,12 +6,13 @@
   "frontend": {
     "port": 5173
   },
-  "marcus_data_path": "/Users/lwgray/dev/marcus/data",
+  "marcus_data_path": null,
+  "_comment_marcus_data_path": "Machine-specific Marcus data dir. Leave null — `./cato start` prompts for it on first run and writes the answer to config.local.json (gitignored). You may also set the MARCUS_ROOT env var.",
   "history_cutoff_date": "2026-04-14",
   "_comment_history_cutoff_date": "Only show projects and load logs on/after this date (YYYY-MM-DD). Leave null to show all.",
-  "_comment_marcus_data_paths": "Uncomment to watch multiple parallel Marcus instances (overrides marcus_data_path)",
+  "_comment_marcus_data_paths": "To watch multiple parallel Marcus instances, set marcus_data_paths in config.local.json (overrides marcus_data_path)",
   "_marcus_data_paths_example": [
-    "/Users/lwgray/dev/marcus/data",
+    "/path/to/marcus/data",
     "/tmp/parallel_exp_1/data",
     "/tmp/parallel_exp_2/data"
   ]

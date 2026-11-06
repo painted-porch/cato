@@ -38,6 +38,9 @@ Thumbs.db
 # data/marcus_state/
 data
 
+# Local machine-specific config (Marcus path) — written by `./cato`
+config.local.json
+
 # Build
 *.egg-info/
 dist/

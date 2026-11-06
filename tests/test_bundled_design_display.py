@@ -124,7 +124,10 @@ def test_filter_tasks_includes_bundled_design_tasks(
     """
     from cato_src.core.aggregator import Aggregator
 
-    aggregator = Aggregator()
+    # Explicit root: these tests exercise pure filter logic and never read
+    # the filesystem, so any existing dir works — and passing it keeps the
+    # test independent of whether Marcus is installed.
+    aggregator = Aggregator(marcus_root=Path(__file__).parent)
     all_tasks = sample_bundled_design_tasks + sample_regular_tasks
 
     # Test subtasks view mode
@@ -167,7 +170,10 @@ def test_filter_tasks_includes_parents_without_children(sample_regular_tasks):
     """
     from cato_src.core.aggregator import Aggregator
 
-    aggregator = Aggregator()
+    # Explicit root: these tests exercise pure filter logic and never read
+    # the filesystem, so any existing dir works — and passing it keeps the
+    # test independent of whether Marcus is installed.
+    aggregator = Aggregator(marcus_root=Path(__file__).parent)
 
     filtered = aggregator._filter_tasks_by_view(
         sample_regular_tasks, view_mode="subtasks"
@@ -195,7 +201,10 @@ def test_filter_tasks_includes_design_tasks_in_dependency_chain(
     """
     from cato_src.core.aggregator import Aggregator
 
-    aggregator = Aggregator()
+    # Explicit root: these tests exercise pure filter logic and never read
+    # the filesystem, so any existing dir works — and passing it keeps the
+    # test independent of whether Marcus is installed.
+    aggregator = Aggregator(marcus_root=Path(__file__).parent)
 
     # Add a task that depends on the design task
     tasks = sample_bundled_design_tasks + [
@@ -224,7 +233,10 @@ def test_all_view_mode_shows_everything():
     """Test that 'all' view mode shows all tasks."""
     from cato_src.core.aggregator import Aggregator
 
-    aggregator = Aggregator()
+    # Explicit root: these tests exercise pure filter logic and never read
+    # the filesystem, so any existing dir works — and passing it keeps the
+    # test independent of whether Marcus is installed.
+    aggregator = Aggregator(marcus_root=Path(__file__).parent)
 
     tasks = [
         {"id": "task1", "is_subtask": True, "parent_task_id": "parent1"},
@@ -246,7 +258,10 @@ def test_parents_view_mode_excludes_subtasks():
     """Test that 'parents' view mode only shows parent tasks."""
     from cato_src.core.aggregator import Aggregator
 
-    aggregator = Aggregator()
+    # Explicit root: these tests exercise pure filter logic and never read
+    # the filesystem, so any existing dir works — and passing it keeps the
+    # test independent of whether Marcus is installed.
+    aggregator = Aggregator(marcus_root=Path(__file__).parent)
 
     tasks = [
         {"id": "task1", "is_subtask": True, "parent_task_id": "parent1"},

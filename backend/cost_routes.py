@@ -63,18 +63,12 @@ _marcus_all_operations: Any = None
 try:
     import sys
 
-    # Mirror the historical-mode discovery in backend/api.py: search a few
-    # well-known Marcus locations and add its root to sys.path.
-    _possible_roots = [
-        Path(__file__).parent.parent.parent / "marcus",  # sibling
-        Path.home() / "dev" / "marcus",
-        Path("/Users/lwgray/dev/marcus"),
-    ]
-    _marcus_root: Optional[Path] = None
-    for _root in _possible_roots:
-        if (_root / "src" / "cost_tracking").exists():
-            _marcus_root = _root
-            break
+    # Locate Marcus the same way backend/api.py does — MARCUS_ROOT env var,
+    # config.json/config.local.json, then auto-detection — and add its
+    # root to sys.path.
+    from cato_src.core.marcus_paths import discover_marcus_root
+
+    _marcus_root: Optional[Path] = discover_marcus_root("src/cost_tracking")
     if _marcus_root is not None:
         if str(_marcus_root) not in sys.path:
             sys.path.insert(0, str(_marcus_root))

@@ -1,7 +1,9 @@
 # Core dependencies
 mcp==1.10.0
 anthropic>=0.18.0,<1.0.0
-httpx>=0.25.0
+# Capped <0.28: httpx 0.28 dropped the `app=` shortcut that
+# starlette 0.27's TestClient relies on (breaks the test suite).
+httpx>=0.25.0,<0.28
 aiofiles>=0.8.0
 psutil>=5.9.0
 structlog>=24.0.0

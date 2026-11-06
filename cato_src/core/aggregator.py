@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Literal, Optional, Set, Tuple
 
+from cato_src.core.marcus_paths import discover_marcus_root
 from cato_src.core.store import (
     Agent,
     Artifact,
@@ -158,8 +159,16 @@ class Aggregator:
         elif marcus_root is not None:
             self.marcus_roots = [Path(marcus_root)]
         else:
-            # Auto-detect: assumes viz is a subdirectory of Marcus
-            auto_root = Path(__file__).parent.parent.parent
+            # Auto-detect via the shared resolver (MARCUS_ROOT env var,
+            # config.json/config.local.json, then well-known locations).
+            # Single source of truth — see cato_src/core/marcus_paths.py.
+            auto_root = discover_marcus_root("data")
+            if auto_root is None:
+                raise RuntimeError(
+                    "Could not locate the Marcus installation. Set the "
+                    "MARCUS_ROOT environment variable, run `./cato` to "
+                    "configure it, or pass marcus_root= explicitly."
+                )
             self.marcus_roots = [auto_root]
 
         # Primary root (backward compat attribute)

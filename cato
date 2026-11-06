@@ -26,12 +26,113 @@ BACKEND_PORT=$(python3 -c "import json; print(json.load(open('config.json'))['ba
 BACKEND_HOST=$(python3 -c "import json; print(json.load(open('config.json'))['backend']['host'])" 2>/dev/null || echo "localhost")
 FRONTEND_PORT=$(python3 -c "import json; print(json.load(open('config.json'))['frontend']['port'])" 2>/dev/null || echo "5173")
 
+# Ensure Cato knows where the Marcus installation lives.
+# Prompts once on first run; the answer is saved to config.local.json
+# (gitignored). Skipped when already configured or MARCUS_ROOT is set.
+# "Configured" honours both config keys the backend reads — a single
+# marcus_data_path or a marcus_data_paths list (one entry per parallel
+# Marcus instance) — in config.json or config.local.json, so a multi-root
+# setup is never mistaken for a fresh install and overwritten.
+ensure_marcus_config() {
+    # MARCUS_ROOT env var overrides everything — no prompt.
+    if [ -n "$MARCUS_ROOT" ]; then
+        if [ -d "$MARCUS_ROOT/data" ] && [ -d "$MARCUS_ROOT/src" ]; then
+            return 0
+        fi
+        echo -e "${YELLOW}Warning: MARCUS_ROOT set but '$MARCUS_ROOT' is missing 'data/' or 'src/'${NC}"
+    fi
+
+    # Ask the shared resolver what is configured and what still exists.
+    # First line: OK (at least one configured data dir exists), BAD (all
+    # configured dirs are missing) or UNSET (nothing configured). Any
+    # further lines are the missing paths, one per line.
+    local report verdict missing
+    report=$(PYTHONPATH="$SCRIPT_DIR" python3 - <<'PY' 2>/dev/null || echo "ERROR"
+from cato_src.core.marcus_paths import (
+    configured_marcus_data_paths,
+    existing_configured_marcus_data_paths,
+)
+
+configured = configured_marcus_data_paths()
+existing = set(existing_configured_marcus_data_paths())
+missing = [str(p) for p in configured if p not in existing]
+if not configured:
+    print("UNSET")
+elif existing:
+    print("OK")
+else:
+    print("BAD")
+for path in missing:
+    print(path)
+PY
+)
+    verdict=$(printf '%s\n' "$report" | head -n 1)
+    missing=$(printf '%s\n' "$report" | tail -n +2)
+
+    case "$verdict" in
+        OK)
+            if [ -n "$missing" ]; then
+                echo -e "${YELLOW}Warning: some configured Marcus data paths are missing:${NC}"
+                echo "$missing" | sed 's/^/  /'
+                echo "Edit config.local.json (or config.json) to remove or correct them."
+            fi
+            return 0
+            ;;
+        UNSET)
+            ;;
+        BAD)
+            echo -e "${YELLOW}Saved Marcus data path(s) no longer exist — reconfiguring:${NC}"
+            echo "$missing" | sed 's/^/  /'
+            ;;
+        *)
+            echo -e "${RED}Error: could not read Cato's config (python3 with cato_src on PYTHONPATH is required).${NC}"
+            exit 1
+            ;;
+    esac
+
+    # Need to prompt — but only if we have an interactive terminal.
+    if [ ! -t 0 ]; then
+        echo -e "${RED}Error: Marcus path not configured and no terminal to prompt.${NC}"
+        echo "Set the MARCUS_ROOT env var, or create config.local.json with a"
+        echo '"marcus_data_path" key (or a "marcus_data_paths" list) pointing at'
+        echo "your Marcus data directory."
+        exit 1
+    fi
+
+    echo -e "${BLUE}Cato needs to know where your Marcus installation lives.${NC}"
+    while true; do
+        read -r -p "Path to your Marcus root directory: " marcus_root
+        marcus_root="${marcus_root/#\~/$HOME}"
+        if [ -z "$marcus_root" ]; then
+            echo -e "${RED}No path entered. Aborting.${NC}"
+            exit 1
+        fi
+        if [ -d "$marcus_root/data" ] && [ -d "$marcus_root/src" ]; then
+            PYTHONPATH="$SCRIPT_DIR" python3 - "$marcus_root" <<'PY'
+import sys
+from pathlib import Path
+
+from cato_src.core.marcus_paths import write_local_marcus_root
+
+write_local_marcus_root(Path(sys.argv[1]))
+PY
+            echo -e "${GREEN}✓ Saved Marcus path to config.local.json${NC}"
+            return 0
+        fi
+        echo -e "${RED}'$marcus_root' is missing a 'data/' or 'src/' directory.${NC}"
+        echo "Enter the Marcus root — the folder containing both 'data/' and 'src/'."
+    done
+}
+
 # Functions
 start_backend() {
     if lsof -Pi :${BACKEND_PORT} -sTCP:LISTEN -t >/dev/null 2>&1; then
         echo -e "${YELLOW}Backend already running on port ${BACKEND_PORT}${NC}"
         return 0
     fi
+
+    # Make sure the Marcus path is configured before the backend imports it.
+    ensure_marcus_config
 
     echo -e "${BLUE}Starting backend on port ${BACKEND_PORT}...${NC}"
     cd "$SCRIPT_DIR"
@@ -169,7 +270,9 @@ Examples:
   cato logs          # View all logs
 
 Configuration:
-  Edit config.json to change ports
+  Edit config.json to change ports.
+  The Marcus install path is asked for on first start and saved to
+  config.local.json. Override anytime with the MARCUS_ROOT env var.
 
 EOF
 }

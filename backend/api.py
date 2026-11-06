@@ -43,18 +43,10 @@ ProjectHistoryQuery = None
 PostProjectAnalyzer = None
 
 try:
-    # Find Marcus root directory
-    possible_marcus_roots = [
-        Path(__file__).parent.parent.parent / "marcus",  # Sibling to cato
-        Path.home() / "dev" / "marcus",  # Common dev location
-        Path("/Users/lwgray/dev/marcus"),  # Absolute path
-    ]
+    # Find Marcus root directory (MARCUS_ROOT / config / auto-detect)
+    from cato_src.core.marcus_paths import discover_marcus_root  # noqa: E402
 
-    for possible_root in possible_marcus_roots:
-        if (possible_root / "src" / "analysis").exists():
-            marcus_root = possible_root
-            break
-
+    marcus_root = discover_marcus_root("src/analysis")
     if not marcus_root:
         raise ImportError("Marcus root directory not found")
 
@@ -99,37 +91,65 @@ if HISTORICAL_MODE_AVAILABLE and ProjectHistoryAggregator and ProjectHistoryQuer
         logger.error(f"Failed to initialize historical analysis components: {e}")
         HISTORICAL_MODE_AVAILABLE = False
 
-# Load Marcus data path(s) and settings from config (for live mode aggregator)
+# Load Marcus data path(s) and settings from config (for live mode aggregator).
+# config.local.json (gitignored, written by the `cato` CLI) overrides config.json
+# for the Marcus-path keys only; load_merged_config() ignores anything else in
+# it. config_path points at the shared config.json — the /api/settings endpoints
+# read and write history_cutoff_date there, and that is the only place it is
+# honored, so the cutoff shown in the UI is the cutoff filtering the data.
 config_path = Path(__file__).parent.parent / "config.json"
 marcus_data_path_root = None
 _extra_marcus_roots: list[Path] = []
 _history_cutoff_date: Optional[str] = None
 try:
-    with open(config_path, "r") as f:
-        config = json.load(f)
-        # Multi-path support: marcus_data_paths overrides marcus_data_path
-        multi_paths = config.get("marcus_data_paths")
-        if multi_paths:
-            _extra_marcus_roots = [Path(p).parent for p in multi_paths]
-            marcus_data_path_root = _extra_marcus_roots[0]
+    from cato_src.core.marcus_paths import (  # noqa: E402
+        live_marcus_roots,
+        load_merged_config,
+        marcus_root_from_env,
+    )
+
+    config = load_merged_config()
+    # MARCUS_ROOT overrides the configured path(s); otherwise the plural
+    # marcus_data_paths list overrides the single marcus_data_path. The same
+    # precedence the launcher and discover_marcus_root() use, so the live
+    # snapshot and the historical modules always read the same install.
+    _extra_marcus_roots = live_marcus_roots()
+    if _extra_marcus_roots:
+        marcus_data_path_root = _extra_marcus_roots[0]
+        if marcus_root_from_env() is not None:
             logger.info(
-                f"Using {len(_extra_marcus_roots)} Marcus data paths from config"
+                f"MARCUS_ROOT set: live mode uses {marcus_data_path_root} "
+                "and ignores any configured Marcus data paths"
             )
         else:
-            marcus_data_path = config.get("marcus_data_path")
-            if marcus_data_path:
-                marcus_data_path_root = Path(marcus_data_path).parent
-                _extra_marcus_roots = [marcus_data_path_root]
-                logger.info(
-                    f"Using Marcus data path from config: {marcus_data_path_root}"
-                )
-            else:
-                logger.info("No Marcus data path in config, using auto-detection")
-        _history_cutoff_date = config.get("history_cutoff_date")
-        if _history_cutoff_date:
-            logger.info(f"History cutoff date: {_history_cutoff_date}")
+            logger.info(
+                f"Using {len(_extra_marcus_roots)} Marcus root(s) from config: "
+                + ", ".join(str(r) for r in _extra_marcus_roots)
+            )
+    else:
+        logger.info("No Marcus data path in config, using auto-detection")
+    if os.environ.get("MARCUS_ROOT") and marcus_root_from_env() is None:
+        logger.warning(
+            f"MARCUS_ROOT='{os.environ['MARCUS_ROOT']}' has no data/ directory; "
+            "ignoring it"
+        )
+    _history_cutoff_date = config.get("history_cutoff_date")
+    if _history_cutoff_date:
+        logger.info(f"History cutoff date: {_history_cutoff_date}")
 except Exception as e:
-    logger.warning(f"Could not load config.json: {e}, using auto-detection")
+    logger.warning(f"Could not load config: {e}, using auto-detection")
+
+
+def _project_history_dir() -> Optional[Path]:
+    """Resolve Marcus's ``data/project_history`` directory.
+
+    Uses the discovered Marcus root, falling back to the config-derived
+    data path root. Returns None when Marcus's location is unknown — no
+    machine-specific path is assumed.
+    """
+    root = marcus_root or marcus_data_path_root
+    return (root / "data" / "project_history") if root else None
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -154,14 +174,42 @@ from backend.cost_routes import router as cost_router  # noqa: E402
 
 app.include_router(cost_router)
 
-# Initialize aggregator for snapshot API — multi-root if configured
-aggregator = (
-    Aggregator(
+# Initialize aggregator for snapshot API — multi-root if configured.
+# Resolve a concrete Marcus root up front so a missing/misconfigured
+# install fails loudly *at server startup* (see the startup event) rather
+# than silently serving an empty dashboard.
+#
+# Import must not raise: the test suite imports this module without Marcus
+# present. When resolution fails we record the reason in _aggregator_error
+# and bind `aggregator` to a placeholder pointed at a non-existent root —
+# the startup event refuses to serve before any request can use it, so the
+# placeholder is never read. This keeps `aggregator` a plain Aggregator for
+# every endpoint instead of an Optional that each would have to None-check.
+_aggregator_error: Optional[str] = None
+
+if _extra_marcus_roots:
+    aggregator = Aggregator(
         marcus_roots=_extra_marcus_roots, history_cutoff_date=_history_cutoff_date
     )
-    if _extra_marcus_roots
-    else Aggregator(marcus_root=marcus_root, history_cutoff_date=_history_cutoff_date)
-)
+else:
+    from cato_src.core.marcus_paths import (  # noqa: E402
+        discover_marcus_root as _discover,
+    )
+
+    _live_root = marcus_root or marcus_data_path_root or _discover("data")
+    if _live_root is None:
+        _aggregator_error = (
+            "Cato could not locate the Marcus installation. Set the "
+            "MARCUS_ROOT environment variable, or run `./cato` to configure "
+            "it (this writes config.local.json)."
+        )
+        logger.error(_aggregator_error)
+        aggregator = Aggregator(marcus_root=Path("/nonexistent/marcus-not-configured"))
+    else:
+        logger.info(f"Live-mode aggregator using Marcus root: {_live_root}")
+        aggregator = Aggregator(
+            marcus_root=_live_root, history_cutoff_date=_history_cutoff_date
+        )
 
 # Simple in-memory cache for snapshots (60s TTL for better performance)
 snapshot_cache: Dict[str, tuple[Dict[str, Any], datetime]] = {}
@@ -277,7 +325,16 @@ def background_cache_refresh() -> None:
 
 @app.on_event("startup")  # type: ignore[misc]
 async def startup_event() -> None:
-    """Run background tasks on startup."""
+    """Run background tasks on startup.
+
+    Fails loudly if the Marcus installation could not be located: an
+    observability dashboard with no data source should refuse to start,
+    not serve an empty UI. Import-time resolution stays non-fatal so the
+    test suite can import this module without Marcus present.
+    """
+    if _aggregator_error is not None:
+        raise RuntimeError(_aggregator_error)
+
     import threading
 
     # DISABLED: Pre-warming was causing slow startup with many projects
@@ -499,13 +556,20 @@ async def update_settings(body: Dict[str, Any]) -> Dict[str, Any]:
         with open(config_path, "w") as f:
             json.dump(cfg, f, indent=2)
 
-        # Reinitialize aggregator with new cutoff
+        # Reinitialize aggregator with new cutoff, reusing the Marcus
+        # root(s) already resolved at startup so we don't re-run discovery.
+        if _aggregator_error is not None:
+            raise HTTPException(status_code=503, detail=_aggregator_error)
+
         new_cutoff: Optional[str] = cfg.get("history_cutoff_date")
-        aggregator = (
-            Aggregator(marcus_roots=_extra_marcus_roots, history_cutoff_date=new_cutoff)
-            if _extra_marcus_roots
-            else Aggregator(marcus_root=marcus_root, history_cutoff_date=new_cutoff)
-        )
+        if _extra_marcus_roots:
+            aggregator = Aggregator(
+                marcus_roots=_extra_marcus_roots, history_cutoff_date=new_cutoff
+            )
+        else:
+            aggregator = Aggregator(
+                marcus_root=aggregator.marcus_root, history_cutoff_date=new_cutoff
+            )
 
         # Invalidate snapshot cache so next request re-reads with new cutoff
         snapshot_cache.clear()
@@ -513,6 +577,8 @@ async def update_settings(body: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Settings updated: history_cutoff_date={new_cutoff}")
         return {"history_cutoff_date": new_cutoff}
 
+    except HTTPException:
+        raise  # propagate 503 (Marcus missing) without masking it as 500
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1197,13 +1263,10 @@ async def list_historical_projects() -> Any:
                 )
 
         # Find all project IDs from persistence layer
-        if marcus_root:
-            history_dir = marcus_root / "data" / "project_history"
-        else:
-            history_dir = Path.home() / "dev" / "marcus" / "data" / "project_history"
+        history_dir = _project_history_dir()
 
         active_projects_data = []
-        if history_dir.exists():
+        if history_dir and history_dir.exists():
             logger.info(f"Scanning for historical projects in {history_dir}")
 
             # OPTIMIZATION: Only load summaries for active projects
@@ -1320,13 +1383,10 @@ async def list_all_historical_projects(
                 logger.warning(f"Could not load project registry: {e}")
 
         # Find all historical projects
-        if marcus_root:
-            history_dir = marcus_root / "data" / "project_history"
-        else:
-            history_dir = Path.home() / "dev" / "marcus" / "data" / "project_history"
+        history_dir = _project_history_dir()
 
         all_projects = []
-        if history_dir.exists():
+        if history_dir and history_dir.exists():
             logger.info(f"Scanning for all historical projects in {history_dir}")
             for project_dir in history_dir.iterdir():
                 if project_dir.is_dir():
@@ -1399,14 +1459,9 @@ async def stream_historical_projects_list() -> StreamingResponse:
             yield f"data: {event_data}\n\n"
             await asyncio.sleep(0.1)
 
-            if marcus_root:
-                history_dir = marcus_root / "data" / "project_history"
-            else:
-                history_dir = (
-                    Path.home() / "dev" / "marcus" / "data" / "project_history"
-                )
+            history_dir = _project_history_dir()
 
-            if not history_dir.exists():
+            if not history_dir or not history_dir.exists():
                 event_data = json.dumps(
                     {
                         "type": "error",

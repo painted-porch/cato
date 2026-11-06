@@ -47,7 +47,9 @@ dev = [
     "pre-commit>=3.5.0",
     "types-aiofiles",
     "types-requests",
-    "httpx>=0.24.0",
+    # Capped <0.28: httpx 0.28 dropped the `app=` shortcut that
+    # starlette 0.27's TestClient relies on (breaks the test suite).
+    "httpx>=0.24.0,<0.28",
 ]
 
 [project.urls]

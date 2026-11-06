@@ -11,6 +11,9 @@ pytest>=7.0.0
 pytest-cov>=4.0.0
 pytest-asyncio>=0.21.0
 pytest-mock>=3.10.0
+# httpx capped <0.28: 0.28 dropped the `app=` shortcut that
+# starlette 0.27's TestClient relies on (breaks the test suite).
+httpx>=0.25.0,<0.28
 
 # Additional development tools
 types-requests
