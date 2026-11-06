@@ -454,3 +454,233 @@ class TestParallelMessageLoading:
         agg = Aggregator(marcus_root=root)
         messages = agg._load_messages()
         assert any(m.get("from_agent_id") == "agent_solo" for m in messages)
+
+
+def _write_decisions_json(
+    root: Path, project_id: str, decisions: list[dict[str, Any]]
+) -> None:
+    """Write a decisions.json file as Marcus's JSON-fallback export would."""
+    history_dir = root / "data" / "project_history" / project_id
+    history_dir.mkdir(parents=True, exist_ok=True)
+    with open(history_dir / "decisions.json", "w") as f:
+        json.dump({"decisions": decisions}, f)
+
+
+def _write_artifacts_json(
+    root: Path, project_id: str, artifacts: list[dict[str, Any]]
+) -> None:
+    """Write an artifacts.json file as Marcus's JSON-fallback export would."""
+    history_dir = root / "data" / "project_history" / project_id
+    history_dir.mkdir(parents=True, exist_ok=True)
+    with open(history_dir / "artifacts.json", "w") as f:
+        json.dump({"artifacts": artifacts}, f)
+
+
+class TestParallelDecisionArtifactLoading:
+    """_load_decisions/_load_artifacts must be root-aware, like task loading
+    already is (cato#50).
+
+    Reproduces the live bug found 2026-11-05: a project living in a
+    non-primary root returned 0 decisions/artifacts even though the data
+    genuinely existed, because the persistence lookup only ever looked at
+    marcus_root (the first root), never the root that actually owns the
+    project being queried.
+    """
+
+    def test_decisions_loaded_from_non_primary_root(self, tmp_path: Path) -> None:
+        """A project living only in root_b's history must still load its decisions."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        _write_projects(
+            root_a,
+            {"proj_a": {"id": "proj_a", "name": "Alpha", "created_at": "2026-01-01"}},
+        )
+        _write_projects(
+            root_b,
+            {"proj_b": {"id": "proj_b", "name": "Beta", "created_at": "2026-01-02"}},
+        )
+        _write_decisions_json(
+            root_b, "proj_b", [{"id": "d1", "project_id": "proj_b", "what": "chose X"}]
+        )
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+        agg._load_projects()  # populate _project_root
+
+        decisions = agg._load_decisions(project_id="proj_b")
+        ids = {d["id"] for d in decisions}
+        assert "d1" in ids, "Decision from root_b not loaded when proj_b is queried"
+
+    def test_artifacts_loaded_from_non_primary_root(self, tmp_path: Path) -> None:
+        """A project living only in root_b's history must still load its artifacts."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        _write_projects(
+            root_a,
+            {"proj_a": {"id": "proj_a", "name": "Alpha", "created_at": "2026-01-01"}},
+        )
+        _write_projects(
+            root_b,
+            {"proj_b": {"id": "proj_b", "name": "Beta", "created_at": "2026-01-02"}},
+        )
+        _write_artifacts_json(
+            root_b,
+            "proj_b",
+            [{"id": "a1", "project_id": "proj_b", "name": "report.md"}],
+        )
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+        agg._load_projects()
+
+        artifacts = agg._load_artifacts(project_id="proj_b")
+        ids = {a["id"] for a in artifacts}
+        assert "a1" in ids, "Artifact from root_b not loaded when proj_b is queried"
+
+    def test_decisions_still_load_from_primary_root_first(self, tmp_path: Path) -> None:
+        """Querying root_a's own project (the primary root) must keep working."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        _write_projects(
+            root_a,
+            {"proj_a": {"id": "proj_a", "name": "Alpha", "created_at": "2026-01-01"}},
+        )
+        _write_projects(
+            root_b,
+            {"proj_b": {"id": "proj_b", "name": "Beta", "created_at": "2026-01-02"}},
+        )
+        _write_decisions_json(
+            root_a,
+            "proj_a",
+            [{"id": "d_a1", "project_id": "proj_a", "what": "chose Y"}],
+        )
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+        agg._load_projects()
+
+        decisions = agg._load_decisions(project_id="proj_a")
+        ids = {d["id"] for d in decisions}
+        assert "d_a1" in ids
+
+    def test_querying_root_a_then_root_b_does_not_lock_onto_root_a(
+        self, tmp_path: Path
+    ) -> None:
+        """Resolving one project from root_a must not poison later lookups for
+        a project in root_b -- the exact caching failure mode from cato#50."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        _write_projects(
+            root_a,
+            {"proj_a": {"id": "proj_a", "name": "Alpha", "created_at": "2026-01-01"}},
+        )
+        _write_projects(
+            root_b,
+            {"proj_b": {"id": "proj_b", "name": "Beta", "created_at": "2026-01-02"}},
+        )
+        _write_decisions_json(
+            root_a,
+            "proj_a",
+            [{"id": "d_a1", "project_id": "proj_a", "what": "chose Y"}],
+        )
+        _write_decisions_json(
+            root_b,
+            "proj_b",
+            [{"id": "d_b1", "project_id": "proj_b", "what": "chose Z"}],
+        )
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+        agg._load_projects()
+
+        # Query root_a's project first (this is what resolves/caches persistence today).
+        first = agg._load_decisions(project_id="proj_a")
+        assert {d["id"] for d in first} == {"d_a1"}
+
+        # Now query root_b's project -- must not come back empty or return proj_a's data.
+        second = agg._load_decisions(project_id="proj_b")
+        assert {d["id"] for d in second} == {"d_b1"}
+
+    def test_json_fallback_applies_per_root_not_on_combined_emptiness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A root needing JSON fallback must not lose its data just because
+        another root succeeded via persistence (Codex finding on cato#50's
+        fix PR: testing whether the combined result across every root is
+        empty, instead of each root independently, hides root_a's
+        JSON-only decisions the moment root_b's persistence succeeds)."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        # root_a has no sqlite persistence for its project -- only a JSON export.
+        (root_a / "data" / "project_history" / "proj_a").mkdir(parents=True)
+        _write_decisions_json(
+            root_a,
+            "proj_a",
+            [{"id": "d_a1", "project_id": "proj_a", "what": "chose Y"}],
+        )
+        # root_b has a real persistence-backed project (no JSON needed).
+        (root_b / "data" / "project_history" / "proj_b").mkdir(parents=True)
+
+        class _FakeDecision:
+            def __init__(self, data: dict[str, Any]) -> None:
+                self._data = data
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._data
+
+        class _FakePersistence:
+            async def load_decisions(self, pid: str) -> list[_FakeDecision]:
+                if pid == "proj_b":
+                    return [_FakeDecision({"id": "d_b1", "project_id": "proj_b"})]
+                return []
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+
+        def _fake_get_persistence(root: Path) -> Any:
+            return _FakePersistence() if root == root_b else None
+
+        monkeypatch.setattr(agg, "_get_marcus_persistence", _fake_get_persistence)
+
+        decisions = agg._load_decisions(project_id=None)
+        ids = {d["id"] for d in decisions}
+        assert "d_b1" in ids, "root_b's persistence-backed decision missing"
+        assert "d_a1" in ids, (
+            "root_a's JSON-fallback decision was dropped because root_b's "
+            "persistence succeeded -- fallback must be evaluated per root"
+        )
+
+    def test_artifact_json_fallback_applies_per_root_not_on_combined_emptiness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same fallback-must-be-per-root fix, for artifacts."""
+        root_a = _make_marcus_root(tmp_path, "a")
+        root_b = _make_marcus_root(tmp_path, "b")
+        (root_a / "data" / "project_history" / "proj_a").mkdir(parents=True)
+        _write_artifacts_json(
+            root_a, "proj_a", [{"id": "a_a1", "project_id": "proj_a", "name": "x.md"}]
+        )
+        (root_b / "data" / "project_history" / "proj_b").mkdir(parents=True)
+
+        class _FakeArtifact:
+            def __init__(self, data: dict[str, Any]) -> None:
+                self._data = data
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._data
+
+        class _FakePersistence:
+            async def load_artifacts(self, pid: str) -> list[_FakeArtifact]:
+                if pid == "proj_b":
+                    return [_FakeArtifact({"id": "a_b1", "project_id": "proj_b"})]
+                return []
+
+        agg = Aggregator(marcus_roots=[root_a, root_b])
+
+        def _fake_get_persistence(root: Path) -> Any:
+            return _FakePersistence() if root == root_b else None
+
+        monkeypatch.setattr(agg, "_get_marcus_persistence", _fake_get_persistence)
+
+        artifacts = agg._load_artifacts(project_id=None)
+        ids = {a["id"] for a in artifacts}
+        assert "a_b1" in ids, "root_b's persistence-backed artifact missing"
+        assert "a_a1" in ids, (
+            "root_a's JSON-fallback artifact was dropped because root_b's "
+            "persistence succeeded -- fallback must be evaluated per root"
+        )
