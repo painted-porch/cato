@@ -100,23 +100,37 @@ marcus_data_path_root = None
 _extra_marcus_roots: list[Path] = []
 _history_cutoff_date: Optional[str] = None
 try:
-    from cato_src.core.marcus_paths import load_merged_config  # noqa: E402
+    from cato_src.core.marcus_paths import (  # noqa: E402
+        live_marcus_roots,
+        load_merged_config,
+        marcus_root_from_env,
+    )
 
     config = load_merged_config()
-    # Multi-path support: marcus_data_paths overrides marcus_data_path
-    multi_paths = config.get("marcus_data_paths")
-    if multi_paths:
-        _extra_marcus_roots = [Path(p).expanduser().parent for p in multi_paths]
+    # MARCUS_ROOT overrides the configured path(s); otherwise the plural
+    # marcus_data_paths list overrides the single marcus_data_path. The same
+    # precedence the launcher and discover_marcus_root() use, so the live
+    # snapshot and the historical modules always read the same install.
+    _extra_marcus_roots = live_marcus_roots()
+    if _extra_marcus_roots:
         marcus_data_path_root = _extra_marcus_roots[0]
-        logger.info(f"Using {len(_extra_marcus_roots)} Marcus data paths from config")
-    else:
-        marcus_data_path = config.get("marcus_data_path")
-        if marcus_data_path:
-            marcus_data_path_root = Path(marcus_data_path).expanduser().parent
-            _extra_marcus_roots = [marcus_data_path_root]
-            logger.info(f"Using Marcus data path from config: {marcus_data_path_root}")
+        if marcus_root_from_env() is not None:
+            logger.info(
+                f"MARCUS_ROOT set: live mode uses {marcus_data_path_root} "
+                "and ignores any configured Marcus data paths"
+            )
         else:
-            logger.info("No Marcus data path in config, using auto-detection")
+            logger.info(
+                f"Using {len(_extra_marcus_roots)} Marcus root(s) from config: "
+                + ", ".join(str(r) for r in _extra_marcus_roots)
+            )
+    else:
+        logger.info("No Marcus data path in config, using auto-detection")
+    if os.environ.get("MARCUS_ROOT") and marcus_root_from_env() is None:
+        logger.warning(
+            f"MARCUS_ROOT='{os.environ['MARCUS_ROOT']}' has no data/ directory; "
+            "ignoring it"
+        )
     _history_cutoff_date = config.get("history_cutoff_date")
     if _history_cutoff_date:
         logger.info(f"History cutoff date: {_history_cutoff_date}")

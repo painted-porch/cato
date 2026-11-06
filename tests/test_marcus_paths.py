@@ -298,6 +298,90 @@ def test_write_local_marcus_root_preserves_other_keys(isolated_config: Path) -> 
     }
 
 
+def test_write_local_marcus_root_masks_tracked_plural_list(
+    isolated_config: Path,
+) -> None:
+    """A replacement root saved locally supersedes a plural list in config.json.
+
+    The tracked ``config.json`` may carry ``marcus_data_paths``; the local
+    file cannot delete a tracked key, so the save must leave an override
+    behind that makes the merged config fall through to the new path.
+    """
+    root = _make_marcus_root(isolated_config, "marcus")
+    _write(
+        isolated_config / "config.json",
+        {"marcus_data_paths": ["/dead/one/data", "/dead/two/data"]},
+    )
+    marcus_paths.write_local_marcus_root(root)
+    assert marcus_paths.configured_marcus_data_paths() == [root / "data"]
+    saved = json.loads((isolated_config / "config.local.json").read_text())
+    assert saved["marcus_data_paths"] == []
+
+
+# ---------------------------------------------------------------------------
+# Live-mode roots (what backend/api.py aggregates over)
+# ---------------------------------------------------------------------------
+
+
+def test_live_roots_env_overrides_configured_paths(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MARCUS_ROOT wins over configured data paths for live-mode aggregation.
+
+    Before the fix, any configured key made the backend aggregate the saved
+    installation while the historical modules followed MARCUS_ROOT, so the
+    two halves of the dashboard could show different Marcus installs.
+    """
+    configured = _make_marcus_root(isolated_config, "configured")
+    env_root = _make_marcus_root(isolated_config, "from_env")
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_paths": [str(configured / "data")]},
+    )
+    monkeypatch.setenv("MARCUS_ROOT", str(env_root))
+    assert marcus_paths.live_marcus_roots() == [env_root]
+
+
+def test_live_roots_invalid_env_falls_back_to_config(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A MARCUS_ROOT without a data/ directory is not used for live mode.
+
+    Mirrors the launcher, which warns about an invalid MARCUS_ROOT and
+    falls through to the configured path.
+    """
+    configured = _make_marcus_root(isolated_config, "configured")
+    bogus = isolated_config / "not_marcus"
+    bogus.mkdir()
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_path": str(configured / "data")},
+    )
+    monkeypatch.setenv("MARCUS_ROOT", str(bogus))
+    assert marcus_paths.marcus_root_from_env() is None
+    assert marcus_paths.live_marcus_roots() == [configured]
+
+
+def test_live_roots_follow_configured_paths_in_order(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without MARCUS_ROOT, live roots are the parents of the configured paths."""
+    monkeypatch.delenv("MARCUS_ROOT", raising=False)
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_paths": ["/one/data", "/two/data"]},
+    )
+    assert marcus_paths.live_marcus_roots() == [Path("/one"), Path("/two")]
+
+
+def test_live_roots_empty_when_unconfigured(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No MARCUS_ROOT and no config means the caller must auto-detect."""
+    monkeypatch.delenv("MARCUS_ROOT", raising=False)
+    assert marcus_paths.live_marcus_roots() == []
+
+
 # ---------------------------------------------------------------------------
 # The `cato` launcher's guard, run for real (Codex finding on PR #46)
 # ---------------------------------------------------------------------------

@@ -106,9 +106,11 @@ def write_local_marcus_root(marcus_root: Path) -> Path:
 
     Used by the ``cato`` launcher after prompting on first start. Other
     keys already in ``config.local.json`` are kept. A stale
-    ``marcus_data_paths`` list is removed, because it would otherwise
-    override the path being saved and leave Cato pointing at directories
-    the user just told us are gone.
+    ``marcus_data_paths`` list is removed from the local file, and if the
+    tracked ``config.json`` carries one it is masked with an explicit
+    empty list, because a plural list anywhere in the merged config would
+    otherwise override the path being saved and leave Cato pointing at
+    directories the user just told us are gone.
 
     Parameters
     ----------
@@ -123,11 +125,55 @@ def write_local_marcus_root(marcus_root: Path) -> Path:
     """
     local = _read_json(_LOCAL_CONFIG_PATH)
     local.pop("marcus_data_paths", None)
+    if _read_json(_CONFIG_PATH).get("marcus_data_paths"):
+        # The tracked file carries a list we cannot delete from here. An
+        # explicit empty list in the local file overrides it, and an empty
+        # list means "no plural paths" to every reader, so the singular
+        # path saved below is the one that takes effect.
+        local["marcus_data_paths"] = []
     local["marcus_data_path"] = str(Path(marcus_root).expanduser().resolve() / "data")
     with open(_LOCAL_CONFIG_PATH, "w") as f:
         json.dump(local, f, indent=2)
         f.write("\n")
     return _LOCAL_CONFIG_PATH
+
+
+def marcus_root_from_env() -> Optional[Path]:
+    """Return the Marcus root named by ``MARCUS_ROOT``, if it is usable.
+
+    Returns
+    -------
+    Optional[Path]
+        ``MARCUS_ROOT`` with ``~`` expanded when it is set and contains a
+        ``data/`` directory; None when it is unset or does not look like a
+        Marcus root. Callers decide whether to warn about the latter.
+    """
+    env_root = os.environ.get("MARCUS_ROOT")
+    if not env_root:
+        return None
+    root = Path(env_root).expanduser()
+    return root if (root / "data").is_dir() else None
+
+
+def live_marcus_roots() -> List[Path]:
+    """Return the Marcus roots live-mode aggregation should read.
+
+    ``MARCUS_ROOT`` takes precedence over anything configured, so the
+    environment override steers the whole dashboard and not only the
+    historical modules that go through :func:`discover_marcus_root`.
+    Without it, the roots are the parents of the configured data paths
+    (plural list first, then the single path), in config order.
+
+    Returns
+    -------
+    List[Path]
+        Roots to aggregate over, or an empty list when nothing is set or
+        configured and the caller should fall back to auto-detection.
+    """
+    env_root = marcus_root_from_env()
+    if env_root is not None:
+        return [env_root]
+    return [p.parent for p in configured_marcus_data_paths()]
 
 
 def _config_marcus_root() -> Optional[Path]:
