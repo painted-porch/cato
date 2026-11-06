@@ -29,6 +29,10 @@ FRONTEND_PORT=$(python3 -c "import json; print(json.load(open('config.json'))['f
 # Ensure Cato knows where the Marcus installation lives.
 # Prompts once on first run; the answer is saved to config.local.json
 # (gitignored). Skipped when already configured or MARCUS_ROOT is set.
+# "Configured" honours both config keys the backend reads — a single
+# marcus_data_path or a marcus_data_paths list (one entry per parallel
+# Marcus instance) — in config.json or config.local.json, so a multi-root
+# setup is never mistaken for a fresh install and overwritten.
 ensure_marcus_config() {
     # MARCUS_ROOT env var overrides everything — no prompt.
     if [ -n "$MARCUS_ROOT" ]; then
@@ -38,28 +42,60 @@ ensure_marcus_config() {
         echo -e "${YELLOW}Warning: MARCUS_ROOT set but '$MARCUS_ROOT' is missing 'data/' or 'src/'${NC}"
     fi
 
-    # Already configured locally and still valid?
-    if [ -f "config.local.json" ]; then
-        local ok
-        ok=$(python3 - <<'PY' 2>/dev/null || echo BAD
-import json
-from pathlib import Path
-try:
-    p = json.load(open("config.local.json")).get("marcus_data_path")
-    print("OK" if p and Path(p).expanduser().is_dir() else "BAD")
-except Exception:
+    # Ask the shared resolver what is configured and what still exists.
+    # First line: OK (at least one configured data dir exists), BAD (all
+    # configured dirs are missing) or UNSET (nothing configured). Any
+    # further lines are the missing paths, one per line.
+    local report verdict missing
+    report=$(PYTHONPATH="$SCRIPT_DIR" python3 - <<'PY' 2>/dev/null || echo "ERROR"
+from cato_src.core.marcus_paths import (
+    configured_marcus_data_paths,
+    existing_configured_marcus_data_paths,
+)
+
+configured = configured_marcus_data_paths()
+existing = set(existing_configured_marcus_data_paths())
+missing = [str(p) for p in configured if p not in existing]
+if not configured:
+    print("UNSET")
+elif existing:
+    print("OK")
+else:
     print("BAD")
+for path in missing:
+    print(path)
 PY
 )
-        [ "$ok" = "OK" ] && return 0
-        echo -e "${YELLOW}Saved Marcus data path is missing — reconfiguring.${NC}"
-    fi
+    verdict=$(printf '%s\n' "$report" | head -n 1)
+    missing=$(printf '%s\n' "$report" | tail -n +2)
+
+    case "$verdict" in
+        OK)
+            if [ -n "$missing" ]; then
+                echo -e "${YELLOW}Warning: some configured Marcus data paths are missing:${NC}"
+                echo "$missing" | sed 's/^/  /'
+                echo "Edit config.local.json (or config.json) to remove or correct them."
+            fi
+            return 0
+            ;;
+        UNSET)
+            ;;
+        BAD)
+            echo -e "${YELLOW}Saved Marcus data path(s) no longer exist — reconfiguring:${NC}"
+            echo "$missing" | sed 's/^/  /'
+            ;;
+        *)
+            echo -e "${RED}Error: could not read Cato's config (python3 with cato_src on PYTHONPATH is required).${NC}"
+            exit 1
+            ;;
+    esac
 
     # Need to prompt — but only if we have an interactive terminal.
     if [ ! -t 0 ]; then
         echo -e "${RED}Error: Marcus path not configured and no terminal to prompt.${NC}"
         echo "Set the MARCUS_ROOT env var, or create config.local.json with a"
-        echo '"marcus_data_path" key pointing at your Marcus data directory.'
+        echo '"marcus_data_path" key (or a "marcus_data_paths" list) pointing at'
+        echo "your Marcus data directory."
         exit 1
     fi
 
@@ -72,13 +108,13 @@ PY
             exit 1
         fi
         if [ -d "$marcus_root/data" ] && [ -d "$marcus_root/src" ]; then
-            python3 - "$marcus_root" <<'PY'
-import json, sys
+            PYTHONPATH="$SCRIPT_DIR" python3 - "$marcus_root" <<'PY'
+import sys
 from pathlib import Path
-root = Path(sys.argv[1]).expanduser().resolve()
-with open("config.local.json", "w") as f:
-    json.dump({"marcus_data_path": str(root / "data")}, f, indent=2)
-    f.write("\n")
+
+from cato_src.core.marcus_paths import write_local_marcus_root
+
+write_local_marcus_root(Path(sys.argv[1]))
 PY
             echo -e "${GREEN}✓ Saved Marcus path to config.local.json${NC}"
             return 0

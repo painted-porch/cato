@@ -6,6 +6,8 @@ order (MARCUS_ROOT env var → merged config → auto-detection).
 """
 
 import json
+import shutil
+import subprocess  # nosec B404 - tests run the repo's own launcher script
 from pathlib import Path
 from typing import Any
 
@@ -202,3 +204,202 @@ def test_aggregator_raises_when_marcus_not_found(
     monkeypatch.delenv("MARCUS_ROOT", raising=False)
     with pytest.raises(RuntimeError, match="Marcus"):
         Aggregator()
+
+
+# ---------------------------------------------------------------------------
+# Configured data paths (what the `cato` launcher's first-run guard checks)
+# ---------------------------------------------------------------------------
+
+
+def test_configured_data_paths_empty_when_unconfigured(isolated_config: Path) -> None:
+    """No config at all means no configured Marcus data paths."""
+    assert marcus_paths.configured_marcus_data_paths() == []
+
+
+def test_configured_data_paths_reads_singular_key(isolated_config: Path) -> None:
+    """marcus_data_path (singular) yields a one-element list."""
+    _write(isolated_config / "config.local.json", {"marcus_data_path": "/a/data"})
+    assert marcus_paths.configured_marcus_data_paths() == [Path("/a/data")]
+
+
+def test_configured_data_paths_plural_overrides_singular(
+    isolated_config: Path,
+) -> None:
+    """marcus_data_paths (plural) wins over the singular key, in order.
+
+    Mirrors ``backend/api.py``, where the plural list overrides the single
+    path, so the launcher guard and the backend agree on what is configured.
+    """
+    _write(isolated_config / "config.json", {"marcus_data_path": "/single/data"})
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_paths": ["/one/data", "~/two/data"]},
+    )
+    assert marcus_paths.configured_marcus_data_paths() == [
+        Path("/one/data"),
+        Path("~/two/data").expanduser(),
+    ]
+
+
+def test_configured_data_paths_ignores_malformed_plural(
+    isolated_config: Path,
+) -> None:
+    """A bare string or non-string entries under the plural key are ignored.
+
+    A bare string would otherwise be iterated character by character; the
+    singular key is used instead so a typo does not wipe out the config.
+    """
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_paths": "/not/a/list/data", "marcus_data_path": "/ok/data"},
+    )
+    assert marcus_paths.configured_marcus_data_paths() == [Path("/ok/data")]
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_paths": [None, 3, "", "/good/data"]},
+    )
+    assert marcus_paths.configured_marcus_data_paths() == [Path("/good/data")]
+
+
+def test_existing_configured_data_paths_filters_to_directories(
+    isolated_config: Path,
+) -> None:
+    """Only configured data paths that exist on disk are reported as usable."""
+    present = _make_marcus_root(isolated_config, "present")
+    _write(
+        isolated_config / "config.local.json",
+        {
+            "marcus_data_paths": [
+                str(present / "data"),
+                str(isolated_config / "gone" / "data"),
+            ]
+        },
+    )
+    assert marcus_paths.existing_configured_marcus_data_paths() == [present / "data"]
+
+
+def test_write_local_marcus_root_preserves_other_keys(isolated_config: Path) -> None:
+    """Saving a Marcus root keeps unrelated local settings and drops a stale list.
+
+    The plural key overrides the singular one everywhere else, so leaving a
+    dead ``marcus_data_paths`` behind would make the freshly saved path
+    unreachable.
+    """
+    root = _make_marcus_root(isolated_config, "marcus")
+    _write(
+        isolated_config / "config.local.json",
+        {"marcus_data_paths": ["/dead/data"], "history_cutoff_date": "2026-01-01"},
+    )
+    marcus_paths.write_local_marcus_root(root)
+    saved = json.loads((isolated_config / "config.local.json").read_text())
+    assert saved == {
+        "marcus_data_path": str(root / "data"),
+        "history_cutoff_date": "2026-01-01",
+    }
+
+
+# ---------------------------------------------------------------------------
+# The `cato` launcher's guard, run for real (Codex finding on PR #46)
+# ---------------------------------------------------------------------------
+
+
+def _launcher_sandbox(tmp_path: Path) -> Path:
+    """Copy the ``cato`` launcher into a tmp Cato root with the real package.
+
+    The script ``cd``s to its own directory and imports ``cato_src`` from
+    there, and the package locates its config files relative to its own
+    resolved location, so the sandbox holds a copy of the script, a copy
+    of the ``cato_src`` package (a symlink would resolve back to the repo
+    and read the repo's config) and a minimal ``config.json``.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    sandbox = tmp_path / "cato_root"
+    sandbox.mkdir()
+    (sandbox / "cato").write_bytes((repo_root / "cato").read_bytes())
+    (sandbox / "cato").chmod(0o755)
+    shutil.copytree(
+        repo_root / "cato_src",
+        sandbox / "cato_src",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    _write(
+        sandbox / "config.json",
+        {"backend": {"host": "localhost", "port": 4301}, "frontend": {"port": 5173}},
+    )
+    return sandbox
+
+
+def _run_guard(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> "subprocess.CompletedProcess[str]":
+    """Source the launcher and run ``ensure_marcus_config`` with no terminal."""
+    monkeypatch.delenv("MARCUS_ROOT", raising=False)
+    # Fixed argv, no user input: this is the launcher under test.
+    return subprocess.run(  # nosec B603 B607
+        ["bash", "-c", "source ./cato >/dev/null; ensure_marcus_config"],
+        cwd=sandbox,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_launcher_guard_accepts_plural_only_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config.local.json holding only marcus_data_paths passes the guard.
+
+    Before the fix the guard looked for ``marcus_data_path`` alone, so a
+    multi-root setup was treated as unconfigured: it prompted (or, with no
+    terminal, exited 1) and would have overwritten the list.
+    """
+    sandbox = _launcher_sandbox(tmp_path)
+    root = _make_marcus_root(tmp_path, "marcus")
+    _write(sandbox / "config.local.json", {"marcus_data_paths": [str(root / "data")]})
+    result = _run_guard(sandbox, monkeypatch)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_launcher_guard_accepts_tracked_config_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Marcus path configured in the tracked config.json also passes the guard."""
+    sandbox = _launcher_sandbox(tmp_path)
+    root = _make_marcus_root(tmp_path, "marcus")
+    _write(
+        sandbox / "config.json",
+        {
+            "backend": {"host": "localhost", "port": 4301},
+            "frontend": {"port": 5173},
+            "marcus_data_path": str(root / "data"),
+        },
+    )
+    result = _run_guard(sandbox, monkeypatch)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_launcher_guard_warns_but_passes_when_one_of_several_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One missing instance out of several warns instead of forcing a rewrite."""
+    sandbox = _launcher_sandbox(tmp_path)
+    root = _make_marcus_root(tmp_path, "marcus")
+    gone = tmp_path / "gone" / "data"
+    _write(
+        sandbox / "config.local.json",
+        {"marcus_data_paths": [str(root / "data"), str(gone)]},
+    )
+    result = _run_guard(sandbox, monkeypatch)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert str(gone) in result.stdout + result.stderr
+
+
+def test_launcher_guard_still_fails_without_terminal_when_unconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing configured and no TTY exits non-zero with instructions."""
+    sandbox = _launcher_sandbox(tmp_path)
+    result = _run_guard(sandbox, monkeypatch)
+    assert result.returncode != 0
+    assert "MARCUS_ROOT" in result.stdout + result.stderr
