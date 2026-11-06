@@ -92,9 +92,11 @@ if HISTORICAL_MODE_AVAILABLE and ProjectHistoryAggregator and ProjectHistoryQuer
         HISTORICAL_MODE_AVAILABLE = False
 
 # Load Marcus data path(s) and settings from config (for live mode aggregator).
-# config.local.json (gitignored, written by the `cato` CLI) overrides config.json.
-# config_path points at the shared config.json — the /api/settings endpoints
-# read and write history_cutoff_date there.
+# config.local.json (gitignored, written by the `cato` CLI) overrides config.json
+# for the Marcus-path keys only; load_merged_config() ignores anything else in
+# it. config_path points at the shared config.json — the /api/settings endpoints
+# read and write history_cutoff_date there, and that is the only place it is
+# honored, so the cutoff shown in the UI is the cutoff filtering the data.
 config_path = Path(__file__).parent.parent / "config.json"
 marcus_data_path_root = None
 _extra_marcus_roots: list[Path] = []

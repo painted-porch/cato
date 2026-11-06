@@ -7,7 +7,11 @@ into the code.
 Configuration is layered: ``config.json`` holds shared settings (ports,
 cutoff date) and is committed; ``config.local.json`` holds the
 machine-specific Marcus path and is gitignored. The ``cato`` CLI writes
-``config.local.json`` after prompting the user on first start.
+``config.local.json`` after prompting the user on first start. Only the
+Marcus-path keys are read from the local file: every other setting lives
+in ``config.json`` alone, where the backend's ``/api/settings`` endpoints
+read and write it, so the value that filters the data is always the value
+the dashboard shows.
 
 Two keys describe where Marcus data lives, in either file:
 
@@ -28,14 +32,21 @@ Marcus-root resolution order (first match wins):
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # cato_src/core/marcus_paths.py -> parents[2] is the Cato project root.
 _CATO_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_PATH = _CATO_ROOT / "config.json"
 _LOCAL_CONFIG_PATH = _CATO_ROOT / "config.local.json"
+
+# The only keys config.local.json may override. Everything else is owned by
+# config.json and the /api/settings endpoints that read and write it.
+_LOCAL_OVERLAY_KEYS = ("marcus_data_path", "marcus_data_paths")
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -49,14 +60,31 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def load_merged_config() -> Dict[str, Any]:
-    """Load ``config.json`` overlaid with ``config.local.json``.
+    """Load ``config.json`` overlaid with the Marcus-path keys of ``config.local.json``.
 
-    ``config.local.json`` is gitignored and holds machine-specific
-    settings (the Marcus path); its keys win over the committed
-    ``config.json``.
+    ``config.local.json`` is gitignored and holds the machine-specific
+    Marcus location: ``marcus_data_path`` and ``marcus_data_paths`` win
+    over the committed ``config.json``. Any other key in the local file is
+    ignored and reported, because the backend's settings endpoints read
+    and write those settings in ``config.json`` only; honoring a local
+    copy would make the dashboard filter by one value and display another.
+
+    Returns
+    -------
+    Dict[str, Any]
+        The merged configuration.
     """
     config = _read_json(_CONFIG_PATH)
-    config.update(_read_json(_LOCAL_CONFIG_PATH))
+    local = _read_json(_LOCAL_CONFIG_PATH)
+    ignored = sorted(k for k in local if k not in _LOCAL_OVERLAY_KEYS)
+    if ignored:
+        logger.warning(
+            "Ignoring %s in config.local.json: only %s may be set there; "
+            "other settings belong in config.json",
+            ", ".join(ignored),
+            " and ".join(_LOCAL_OVERLAY_KEYS),
+        )
+    config.update({k: v for k, v in local.items() if k in _LOCAL_OVERLAY_KEYS})
     return config
 
 
@@ -105,7 +133,8 @@ def write_local_marcus_root(marcus_root: Path) -> Path:
     """Record ``marcus_root`` as the single Marcus install in ``config.local.json``.
 
     Used by the ``cato`` launcher after prompting on first start. Other
-    keys already in ``config.local.json`` are kept. A stale
+    keys already in ``config.local.json`` are kept in the file (they are
+    the user's, even though only the Marcus-path keys are read). A stale
     ``marcus_data_paths`` list is removed from the local file, and if the
     tracked ``config.json`` carries one it is masked with an explicit
     empty list, because a plural list anywhere in the merged config would

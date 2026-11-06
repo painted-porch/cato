@@ -89,6 +89,39 @@ def test_merged_config_tolerates_invalid_json(isolated_config: Path) -> None:
     assert marcus_paths.load_merged_config() == {}
 
 
+def test_local_overlay_limited_to_marcus_path_keys(
+    isolated_config: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only the Marcus-path keys in config.local.json override config.json.
+
+    Every other setting (ports, history_cutoff_date, ...) is read and
+    written by the backend's settings endpoints from the shared
+    ``config.json`` alone. If the local file could override them, the
+    dashboard would filter data by one cutoff while displaying another.
+    Ignored keys are reported so a stray setting does not fail silently.
+    """
+    _write(
+        isolated_config / "config.json",
+        {"marcus_data_path": "/shared/data", "history_cutoff_date": "2026-01-01"},
+    )
+    _write(
+        isolated_config / "config.local.json",
+        {
+            "marcus_data_path": "/local/data",
+            "marcus_data_paths": ["/local/a/data"],
+            "history_cutoff_date": "2030-01-01",
+            "backend": {"port": 1},
+        },
+    )
+    with caplog.at_level("WARNING", logger="cato_src.core.marcus_paths"):
+        merged = marcus_paths.load_merged_config()
+    assert merged["marcus_data_path"] == "/local/data"
+    assert merged["marcus_data_paths"] == ["/local/a/data"]
+    assert merged["history_cutoff_date"] == "2026-01-01"
+    assert "backend" not in merged
+    assert "history_cutoff_date" in caplog.text and "backend" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # discover_marcus_root
 # ---------------------------------------------------------------------------
